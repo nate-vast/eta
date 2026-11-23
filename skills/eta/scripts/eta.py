@@ -750,7 +750,7 @@ def cmd_measure(args):
         if args.calls_done is not None:
             flags.append(f"--calls-done {args.calls_done}")
         script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0].endswith(".py") else "~/.eta/eta.py"
-        if script == os.path.realpath(os.path.expanduser("~/.eta/eta.py")):
+        if script == os.path.abspath(os.path.expanduser("~/.eta/eta.py")):
             script = "~/.eta/eta.py"
         next_cmd = (f"python3 {script} estimate " + " ".join(flags) +
                     ' --calls <N> [--wait-min <M>] --note "<what is left>"').replace("  ", " ")
