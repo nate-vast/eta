@@ -2,3 +2,12 @@
 __pycache__/
 *.pyc
 .DS_Store
+verify/work-*/
+verify/eta-home-*/
+verify/pi-agent/sessions/
+verify/pi-agent/auth.json
+verify/*.log.tmp
+verify/dl-*.log
+verify/brew.log
+verify/llama*.log
+verify/mlx.log

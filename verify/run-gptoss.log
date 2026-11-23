@@ -1,0 +1,38 @@
+=== TURN 1 14:53:21
+Implemented `textstats.py` with:
+
+- `word_count`: counts words split on whitespace.
+- `top_words`: returns the most common lowercase words, stripping punctuation, handling ties alphabetically.
+
+**Paused** – ready for the next steps.
+=== TURN 2 /skill:eta 14:53:30
+**ETA: ~1–2 min** (currently at 2:53 PM)
+
+Done so far:
+- Implemented `word_count` and `top_words` in `textstats.py`  
+- Written and saved the module (1 tool call)
+
+Left:
+- Write `test_textstats.py` with unittest covering all functions (empty text, ties, etc.) – 1 call  
+- Run the tests (`python3 -m unittest -v`) and fix any failures – 1–2 calls (including any re‑runs if tests fail)  
+- Draft a brief `README.md` with usage examples – 1 call
+
+Estimated total: **≈4 tool calls** + any wait time (none yet).
+
+I’ll proceed with the next steps.
+=== TURN 3 14:53:35
+ok
+=== END 14:53:36
+=== files
+TASK.md
+textstats.py
+=== tests
+Ran 0 tests in 0.000s
+
+OK
+=== eta log
+NO PREDICTIONS LOGGED
+=== stats
+ETA TRACK RECORD  (0 logged, 0 checked against real finish times)
+
+when                 said             range   actual  hit  task

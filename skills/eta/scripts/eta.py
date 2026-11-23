@@ -42,7 +42,7 @@ CAL_WINDOW = 40            # use the most recent N resolved predictions
 STALE = 20 * 60            # a transcript quiet this long counts as finished
 DEFAULT_SPREAD = (0.6, 1.8)
 
-ETA_START = re.compile(r"^\s*(/eta\b|eta\b|eta[?:])", re.I)
+ETA_START = re.compile(r"^\s*(/eta\b|/skill:eta\b|\$eta\b|eta\b|eta[?:])", re.I)
 ETA_ASK = re.compile(
     r"\b(eta\b|how long|how much longer|time left|time remaining|"
     r"when (will|is) (it|this|that|you)\b.{0,20}\b(done|finished|ready|complete))", re.I)
@@ -182,8 +182,13 @@ def _clean_prompt(content) -> str:
     if m:
         args = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
         return ("/" + m.group(1).strip() + " " + (args.group(1).strip() if args else "")).strip()
-    text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.S)
-    return text.strip()
+    text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.S).strip()
+    # pi expands `/skill:name args` into the skill body wrapped in <skill name="..."> tags
+    m = re.match(r'<skill name="([^"]+)"', text)
+    if m:
+        after = text.split("</skill>", 1)[1].strip() if "</skill>" in text else ""
+        return ("/" + m.group(1) + " " + after).strip()
+    return text
 
 
 def read_claude(path):
@@ -326,7 +331,24 @@ def read_pi(path):
     return events
 
 
+def pi_sessions_dir() -> str:
+    if os.environ.get("PI_CODING_AGENT_SESSION_DIR"):
+        return os.path.expanduser(os.environ["PI_CODING_AGENT_SESSION_DIR"])
+    return os.path.join(os.path.expanduser(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")),
+                        "sessions")
+
+
 def sniff_kind(path) -> str:
+    """Tell transcript formats apart by their first record, falling back to the path."""
+    try:
+        with open(path, errors="replace") as f:
+            first = json.loads(f.readline() or "{}")
+        if first.get("type") == "session_meta" or "payload" in first:
+            return "codex"
+        if first.get("type") == "session" and "cwd" in first:
+            return "pi"
+    except (OSError, json.JSONDecodeError):
+        pass
     if "/.codex/" in path or os.path.basename(path).startswith("rollout-"):
         return "codex"
     if "/.pi/" in path:
@@ -378,8 +400,8 @@ def _all_candidates(agent=None):
     if agent in (None, "codex"):
         out += [(p, "codex") for p in _codex_files(2)]
     if agent in (None, "pi"):
-        out += [(p, "pi") for p in _recent(glob.glob(os.path.expanduser(
-            "~/.pi/agent/sessions/*/*.jsonl")), 1)]
+        out += [(p, "pi") for p in _recent(glob.glob(os.path.join(
+            pi_sessions_dir(), "*", "*.jsonl")), 1)]
     return out
 
 
@@ -400,7 +422,7 @@ def find_transcript(transcript=None, session=None, agent=None, cwd=None):
             if hit:
                 return hit[0], "codex", "session id"
         if agent in (None, "pi"):
-            hit = glob.glob(os.path.expanduser(f"~/.pi/agent/sessions/*/*{glob.escape(sid)}*.jsonl"))
+            hit = glob.glob(os.path.join(pi_sessions_dir(), "*", f"*{glob.escape(sid)}*.jsonl"))
             if hit:
                 return hit[0], "pi", "session id"
     cands = []
@@ -651,7 +673,7 @@ def _measure(args, events, now=None):
     return measure(events, args.from_n, now, parse_started(args.started, now), args.calls_done)
 
 
-def render_measure(path, m, cal, how="") -> str:
+def render_measure(path, m, cal, how="", next_cmd="") -> str:
     L = ["ETA MEASUREMENTS"]
     if not path:
         L.append("transcript: none readable for this harness, so this is self-reported mode.")
@@ -695,9 +717,12 @@ def render_measure(path, m, cal, how="") -> str:
                  f"your raw estimate (median); {cal['hits']}/{cal['n']} landed inside the range")
     else:
         L.append(f"calibration: {cal['n']} past ETAs checked (needs {MIN_CAL}); no correction yet")
-    L.append("NEXT: list the remaining steps, count the tool calls each will really take "
-             "(include test runs, fixes, verification, commits), then run `estimate --calls N "
-             "[--wait-min M]` with the same --session/--from.")
+    L.append("")
+    L.append("REQUIRED NEXT STEP (do not reply to the user yet): list the remaining steps, count "
+             "the tool calls each will really take (include test runs, fixes, verification, "
+             "commits), add known long waits in minutes, then run:")
+    L.append(f"  {next_cmd}")
+    L.append("Reply only after it prints ETA RESULT, using its numbers.")
     return "\n".join(L)
 
 
@@ -711,7 +736,25 @@ def cmd_measure(args):
         print(json.dumps({"transcript": path, "kind": kind, "measure": m, "calibration": cal},
                          indent=2))
     else:
-        print(render_measure(path, m, cal, args.found_how))
+        flags = []
+        if args.session and "$" not in args.session:
+            flags.append(f'--session "{args.session}"')
+        if args.transcript:
+            flags.append(f'--transcript "{args.transcript}"')
+        if args.agent:
+            flags.append(f"--agent {args.agent}")
+        if args.from_n:
+            flags.append(f"--from {args.from_n}")
+        if args.started:
+            flags.append(f'--started "{args.started}"')
+        if args.calls_done is not None:
+            flags.append(f"--calls-done {args.calls_done}")
+        script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0].endswith(".py") else "~/.eta/eta.py"
+        if script == os.path.realpath(os.path.expanduser("~/.eta/eta.py")):
+            script = "~/.eta/eta.py"
+        next_cmd = (f"python3 {script} estimate " + " ".join(flags) +
+                    ' --calls <N> [--wait-min <M>] --note "<what is left>"').replace("  ", " ")
+        print(render_measure(path, m, cal, args.found_how, next_cmd))
 
 
 def cmd_estimate(args):
@@ -772,6 +815,10 @@ def cmd_estimate(args):
     print(f"basis:      {out['basis']}")
     print(f"so far:     {out['elapsed']} on this task, {m['calls']} tool calls")
     print(f"logged:     {'yes, id ' + pid if out['recorded'] else 'no (--no-record)'}")
+    print("NEXT: reply to the user with these numbers (ETA, finish time, range, what's done, "
+          "what's left, basis). If the task isn't finished, do not end your turn: send the ETA "
+          "text together with your next task tool call in the same message, then keep going. "
+          "/eta is a check-in, not a stop.")
 
 
 def cmd_done(args):
@@ -821,7 +868,7 @@ def cmd_stats(args):
     for p in preds[-args.limit:]:
         r = res.get(p["id"])
         actual = fmt_dur(r["actual_s"]) if r and r.get("actual_s") and r["status"] == "ok" else (
-            r["status"] if r else "pending")
+            r["status"] if r else ("too short" if p.get("raw_s", 0) < 60 else "pending"))
         hit = ""
         if r and r.get("status") == "ok":
             hit = "yes" if p["low_s"] <= r["actual_s"] <= p["high_s"] else "no"

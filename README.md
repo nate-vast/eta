@@ -32,6 +32,8 @@ Agents are bad at guessing wall-clock time. They think in human-developer hours 
 | OpenCode, Gemini CLI, Cursor, Amp, others with Agent Skills | the tool's skill invocation | self-reported: the agent passes `--started` and `--calls-done` from its own context, and runs `eta.py done` at the end |
 | Anything else | paste the body of `skills/eta/SKILL.md` as a prompt | self-reported |
 
+**Open models** (tested 2026-11-23 in pi with local gpt-oss-20b and Qwen3-Coder-30B-A3B, see [verify/RESULTS.md](verify/RESULTS.md)): gpt-oss follows the full procedure mid-task and keeps working, though it tends to post the ETA text at the end of its turn. Qwen3-Coder-30B often ignores an `/eta` that arrives mid-turn. Re-run with `verify/rpc_eta.py <provider> <model> <label>`.
+
 Adding a transcript reader for another harness is one function in `eta.py` that emits the shared event shapes (prompt, tool, tool_done, todos); see `read_pi` for a 30-line example.
 
 ## Install

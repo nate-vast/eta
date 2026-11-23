@@ -75,7 +75,10 @@ class Base(unittest.TestCase):
 
 class TestPrompts(unittest.TestCase):
     def test_eta_detection(self):
-        for t in ["/eta", "/eta stats", "eta?", "ETA on this?", "how long left?",
+        self.assertEqual(eta._clean_prompt('<skill name="eta" location="/x/SKILL.md">\nbody\n</skill>\n\nstats'),
+                         "/eta stats")
+        self.assertTrue(eta.is_eta_prompt(eta._clean_prompt('<skill name="eta" location="/x">b</skill>')))
+        for t in ["/eta", "/eta stats", "$eta", "/skill:eta", "eta?", "ETA on this?", "how long left?",
                   "when will it be done", "how much longer"]:
             self.assertTrue(eta.is_eta_prompt(t), t)
         for t in ["build the etag cache layer", "add a beta flag",

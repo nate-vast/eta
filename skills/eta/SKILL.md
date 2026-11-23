@@ -6,7 +6,20 @@ argument-hint: "[stats | which task]"
 
 # /eta
 
-The user wants to know when the current task will be done. Agents guess wall-clock time badly (we tend to think in human-developer hours). So don't guess. Measure your pace from this session, count the work left in tool calls, and let the calibration log correct for your usual bias.
+**The user is asking how long the current task will take. Answer that first, before doing any more work on the task.**
+
+Your very first action must be this tool call:
+
+```bash
+python3 ~/.eta/eta.py measure --session "${CLAUDE_SESSION_ID}"
+```
+
+Then, in order:
+1. Run `estimate` as a second tool call (section 3). Its output starts with `ETA RESULT`.
+2. Reply to the user with the numbers `estimate` printed. Never reply with a number you made up.
+3. If the task isn't finished, keep working in this same turn. In most harnesses a message with no tool call ends your turn, so put the ETA reply and your next task tool call in the same message: the ETA text first, then the call.
+
+Why: agents guess wall-clock time badly (we tend to think in human-developer hours). So measure your pace from this session, count the work left in tool calls, and let the calibration log correct for your usual bias.
 
 Run commands with the script at `~/.eta/eta.py`. If that path is missing, use `scripts/eta.py` next to this SKILL.md. Pass `--session "${CLAUDE_SESSION_ID}"` exactly as written (Claude Code fills it in; elsewhere it expands to nothing and the script finds the session itself).
 
@@ -41,18 +54,20 @@ python3 ~/.eta/eta.py estimate --session "${CLAUDE_SESSION_ID}" --calls N [--wai
 Use the same `--from`, `--started`, `--calls-done` flags as step 1. Report the numbers it prints as they are; don't shave them. If you truly can't count calls, use `--minutes M` instead of `--calls`.
 
 Skip the estimate (nothing gets logged) when:
-- the task is already done: say so and give a one-line summary;
+- the task is already done (check: is every part of the request finished?): reply "Already done." with a one-line summary;
 - you are blocked waiting on the user: say what you need from them;
 - there is no task in progress.
 
 ## 4. Reply
 
-Keep it short, in this shape:
+Keep it short. Fill every <...> from the `ETA RESULT` output and your own step list. Never copy numbers from these instructions:
 
-> **ETA: ~14 min** (done around 3:42 PM, likely 9 to 24 min)
-> Done so far: parser rewritten, 12 of 20 tests passing.
-> Left: fix 8 tests, update docs, commit (about 38 tool calls + a 2 min build).
-> Basis: 19 s per tool call measured on this task; past ETAs ran x1.4 long, corrected. Confidence: medium.
+> **ETA: ~<remaining>** (done around <finish>, likely <low> to <high>)
+> Done so far: <one line>.
+> Left: <steps> (about <N> tool calls<+ waits, if any>).
+> Basis: <basis line from ETA RESULT, in plain words>. Confidence: <confidence>.
+
+If you skipped `estimate` because the task is already done, reply only: **Already done.** plus a one-line summary. No ETA, no numbers.
 
 Then, if you were in the middle of the task when /eta came in, **keep working on it**. /eta is a check-in, not a stop.
 

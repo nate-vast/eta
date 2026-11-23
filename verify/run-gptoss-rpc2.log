@@ -1,0 +1,32 @@
+[   1.9s] tool read {"path": "TASK.md", "offset": 1, "limit": 200}
+[  21.8s] tool write {"path": "textstats.py", "content": "\"\"\"Text statistics utilities.\n\nFunctions:\n- word_count(text) -> int
+[  39.0s] tool write {"path": "test_textstats.py", "content": "\"\"\"Unit tests for textstats module.\n\"\"\"\nimport unittest\nfro
+[  39.0s] >>> steering /skill:eta into the running turn
+[  45.6s] tool write {"path": "README.md", "content": "# textstats\n\nUtility module for basic text statistics.\n\n## Functions\n\n
+[  49.5s] tool bash {"command": "python3 ~/.eta/eta.py measure --session \"${CLAUDE_SESSION_ID}\""}
+[  53.8s] tool bash {"command": "python3 ~/.eta/eta.py estimate --session \"${CLAUDE_SESSION_ID}\" --calls 1 --note \"run tests\""
+[  56.0s] tool bash {"command": "python3 -m unittest -v"}
+[  58.9s] tool edit {"path": "test_textstats.py", "edits": [{"oldText": "txt = \"Hello, world! Hello.\n        \n        \"", "new
+[  60.5s] tool bash {"command": "python3 -m unittest -v"}
+[  66.6s] SAYS: **ETA RESULT**  
+            remaining: ~25 s (likely 15 s – 45 s)  
+            finish: ~3:35 PM (between 3:35 PM and 3:35 PM)  
+            confidence: low  
+            basis: 1 tool call × 25 s = 25 s raw; no calibration yet (0/3 past ETAs checked)  
+            
+            **Done so far:** 4 tool calls (measure, estimate, write 3 files, run tests).  
+            **Left:** 0 tool calls.  
+            **Basis:** 1 tool call × 25 s = 25 s raw.  
+            **Confidence:** low.  
+            
+            The task is now complete. All tests pass.
+[  66.6s] agent_end
+[  73.8s] SAYS: ok
+[  73.8s] agent_end
+
+=== RESULT gptoss-rpc2
+eta.py calls after steer: 2
+tool calls after the ETA commands: 4
+files: ['README.md', 'TASK.md', 'test_textstats.py', 'textstats.py']
+tests: OK
+logged: {'kind': 'pi', 'task': 'Do the whole task in TASK.md, start to finish.', 'calls': 1, 'spc': 25.0, 'pace_source': 'default', 'raw_s': 25.0, 'est_s': 25.0, 'note': 'run tests'}
