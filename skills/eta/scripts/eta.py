@@ -1,0 +1,874 @@
+#!/usr/bin/env python3
+"""eta: turn an agent's own transcript into a calibrated ETA for the current task.
+
+Agents guess wall-clock time badly. This script measures instead:
+  measure   read the live transcript: when the task started, active time, tool calls,
+            seconds per call, long operations, todo progress, past accuracy
+  estimate  remaining tool calls (+ known waits) x measured pace x calibration factor,
+            prints the ETA and logs the prediction
+  stats     how past ETAs compared with when the work really finished
+
+Calibration is automatic: every logged prediction is later checked against the
+transcript (the task is taken as finished when the agent's work stops before the
+next real user prompt), and the median actual/predicted ratio corrects new ETAs.
+
+Works with any agent in any harness:
+  - transcripts read automatically: Claude Code (~/.claude/projects), Codex (~/.codex/sessions),
+    pi (~/.pi/agent/sessions)
+  - anything else: the agent passes --started and --calls-done from its own context, and runs
+    `eta.py done` when it finishes so calibration still learns
+
+Stdlib only, Python 3.9+. Data lives in ~/.eta (override with ETA_HOME).
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import statistics
+import sys
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+
+GAP_CAP = 20 * 60          # a single quiet gap counts as at most this much active time
+LONG_OP = 90               # tool calls at least this long are "long operations"
+DEFAULT_SPC = 25.0         # seconds per tool call when nothing has been measured yet
+MIN_CALLS = 5              # calls needed before trusting this task's own pace
+MIN_CAL = 3                # resolved predictions needed before calibration kicks in
+CAL_WINDOW = 40            # use the most recent N resolved predictions
+STALE = 20 * 60            # a transcript quiet this long counts as finished
+DEFAULT_SPREAD = (0.6, 1.8)
+
+ETA_START = re.compile(r"^\s*(/eta\b|eta\b|eta[?:])", re.I)
+ETA_ASK = re.compile(
+    r"\b(eta\b|how long|how much longer|time left|time remaining|"
+    r"when (will|is) (it|this|that|you)\b.{0,20}\b(done|finished|ready|complete))", re.I)
+SYSTEM_PREFIXES = ("<task-notification>", "This session is being continued",
+                   "<local-command", "Caveat: The messages below")
+
+
+def home() -> str:
+    return os.path.expanduser(os.environ.get("ETA_HOME", "~/.eta"))
+
+
+def pred_path() -> str:
+    return os.path.join(home(), "predictions.jsonl")
+
+
+def res_path() -> str:
+    return os.path.join(home(), "resolutions.jsonl")
+
+
+# ---------------------------------------------------------------- utilities
+
+def parse_ts(s):
+    if not s:
+        return None
+    if isinstance(s, (int, float)):
+        return float(s)
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        try:
+            return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return None
+
+
+def fmt_dur(s: float) -> str:
+    s = max(0, int(round(s)))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{round(s / 60)} min"
+    h, m = divmod(round(s / 60), 60)
+    return f"{h}h {m:02d}m"
+
+
+def fmt_clock(ts: float, now: float | None = None) -> str:
+    now = now or time.time()
+    d = datetime.fromtimestamp(ts)
+    clock = d.strftime("%I:%M %p").lstrip("0")
+    days = (d.date() - datetime.fromtimestamp(now).date()).days
+    if days == 1:
+        return f"{clock} tomorrow"
+    if days > 1:
+        return d.strftime("%a %b %d ") + clock
+    return clock
+
+
+def one_line(text: str, n: int = 120) -> str:
+    t = re.sub(r"\s+", " ", text or "").strip()
+    return t if len(t) <= n else t[: n - 3] + "..."
+
+
+def is_eta_prompt(text: str) -> bool:
+    t = (text or "").strip()
+    if ETA_START.match(t):
+        return True
+    return len(t) <= 120 and bool(ETA_ASK.search(t))
+
+
+def quantile(xs, q):
+    xs = sorted(xs)
+    if not xs:
+        return None
+    k = (len(xs) - 1) * q
+    lo, hi = int(k), min(int(k) + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+
+
+def load_jsonl(path):
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    return out
+
+
+def append_jsonl(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(obj) + "\n")
+
+
+def norm_status(s) -> str:
+    s = str(s or "").lower()
+    if s in ("completed", "complete", "done", "finished"):
+        return "done"
+    if s in ("in_progress", "in-progress", "active", "doing", "running"):
+        return "doing"
+    if s in ("deleted", "cancelled", "canceled", "removed"):
+        return "deleted"
+    return "pending"
+
+
+def tool_desc(inp) -> str:
+    if not isinstance(inp, dict):
+        return one_line(str(inp), 70)
+    for k in ("description", "command", "file_path", "pattern", "url", "query", "prompt", "skill"):
+        v = inp.get(k)
+        if v:
+            return one_line(v if isinstance(v, str) else json.dumps(v), 70)
+    return ""
+
+
+# ---------------------------------------------------------------- transcript readers
+# Both readers emit the same event shapes:
+#   {"ts", "kind": "prompt", "text", "eta"}
+#   {"ts", "kind": "agent"}
+#   {"ts", "kind": "tool", "id", "name", "desc"}     tool call started
+#   {"ts", "kind": "tool_done", "id"}                tool result came back
+#   {"ts", "kind": "todos", "items": [[key, label, status], ...]}   full snapshot
+#   {"ts", "kind": "task", "key", "label"|None, "status"|None}      single-item update
+
+def _clean_prompt(content) -> str:
+    if isinstance(content, list):
+        content = "\n".join(b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") in ("text", "input_text"))
+    text = content if isinstance(content, str) else ""
+    m = re.search(r"<command-name>/?(.*?)</command-name>", text, re.S)
+    if m:
+        args = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
+        return ("/" + m.group(1).strip() + " " + (args.group(1).strip() if args else "")).strip()
+    text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.S)
+    return text.strip()
+
+
+def read_claude(path):
+    events, task_n = [], 0
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            typ = d.get("type")
+            if typ not in ("user", "assistant") or d.get("isSidechain"):
+                continue
+            ts = parse_ts(d.get("timestamp"))
+            if ts is None:
+                continue
+            msg = d.get("message") or {}
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if typ == "assistant":
+                events.append({"ts": ts, "kind": "agent"})
+                for b in content if isinstance(content, list) else []:
+                    if not isinstance(b, dict) or b.get("type") != "tool_use":
+                        continue
+                    name, inp = b.get("name") or "?", b.get("input") or {}
+                    events.append({"ts": ts, "kind": "tool", "id": b.get("id"),
+                                   "name": name, "desc": tool_desc(inp)})
+                    if name == "TodoWrite" and isinstance(inp.get("todos"), list):
+                        items = [[t.get("content") or t.get("activeForm") or str(i),
+                                  t.get("content") or "", norm_status(t.get("status"))]
+                                 for i, t in enumerate(inp["todos"]) if isinstance(t, dict)]
+                        events.append({"ts": ts, "kind": "todos", "items": items})
+                    elif name == "TaskCreate":
+                        task_n += 1
+                        events.append({"ts": ts, "kind": "task", "key": str(task_n),
+                                       "label": inp.get("subject") or inp.get("description") or "",
+                                       "status": "pending"})
+                    elif name == "TaskUpdate" and inp.get("taskId") is not None:
+                        events.append({"ts": ts, "kind": "task", "key": str(inp.get("taskId")),
+                                       "label": inp.get("subject"),
+                                       "status": norm_status(inp["status"]) if inp.get("status") else None})
+                continue
+            # user records
+            if isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        events.append({"ts": ts, "kind": "tool_done", "id": b.get("tool_use_id")})
+                continue
+            if d.get("isMeta") or d.get("isCompactSummary"):
+                continue
+            if d.get("turnOrigin") in ("task_notification", "system"):
+                continue
+            text = _clean_prompt(content)
+            if not text or text.startswith(SYSTEM_PREFIXES):
+                continue
+            events.append({"ts": ts, "kind": "prompt", "text": text, "eta": is_eta_prompt(text)})
+    return events
+
+
+CODEX_SKIP_ITEMS = {"UserMessage", "AgentMessage", "Reasoning"}
+
+
+def read_codex(path):
+    events, last_ts = [], None
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = parse_ts(d.get("timestamp"))
+            if ts is None:
+                continue
+            p = d.get("payload") or {}
+            if d.get("type") == "event_msg" and p.get("type") == "item_completed":
+                it = p.get("item") or {}
+                k = it.get("type")
+                if k == "UserMessage":
+                    text = _clean_prompt([{"type": "text", "text": b.get("text", "")}
+                                          for b in it.get("content") or [] if isinstance(b, dict)])
+                    if text and not text.startswith(SYSTEM_PREFIXES):
+                        events.append({"ts": ts, "kind": "prompt", "text": text,
+                                       "eta": is_eta_prompt(text)})
+                elif k in ("AgentMessage", "Reasoning"):
+                    events.append({"ts": ts, "kind": "agent"})
+                elif k:
+                    # Codex logs tool items when they complete; start ~= previous event.
+                    tid = it.get("id") or uuid.uuid4().hex
+                    cmd = it.get("command")
+                    desc = cmd[-1] if isinstance(cmd, list) and cmd else (
+                        it.get("tool") or it.get("query") or it.get("path") or "")
+                    start = last_ts if last_ts is not None else ts
+                    events.append({"ts": start, "kind": "tool", "id": tid, "name": k,
+                                   "desc": one_line(str(desc), 70)})
+                    events.append({"ts": ts, "kind": "tool_done", "id": tid})
+            elif d.get("type") == "response_item" and p.get("type") == "function_call" \
+                    and p.get("name") == "update_plan":
+                try:
+                    plan = json.loads(p.get("arguments") or "{}").get("plan") or []
+                except (json.JSONDecodeError, AttributeError):
+                    plan = []
+                items = [[t.get("step") or str(i), t.get("step") or "", norm_status(t.get("status"))]
+                         for i, t in enumerate(plan) if isinstance(t, dict)]
+                if items:
+                    events.append({"ts": ts, "kind": "todos", "items": items})
+            last_ts = ts
+    events.sort(key=lambda e: e["ts"])
+    return events
+
+
+def read_pi(path):
+    events = []
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if d.get("type") != "message":
+                continue
+            ts = parse_ts(d.get("timestamp"))
+            msg = d.get("message") or {}
+            role, content = msg.get("role"), msg.get("content")
+            if ts is None:
+                continue
+            if role == "user":
+                text = _clean_prompt(content)
+                if text and not text.startswith(SYSTEM_PREFIXES):
+                    events.append({"ts": ts, "kind": "prompt", "text": text,
+                                   "eta": is_eta_prompt(text)})
+            elif role == "assistant":
+                events.append({"ts": ts, "kind": "agent"})
+                for b in content if isinstance(content, list) else []:
+                    if isinstance(b, dict) and b.get("type") == "toolCall":
+                        events.append({"ts": ts, "kind": "tool", "id": b.get("id"),
+                                       "name": b.get("name") or "?",
+                                       "desc": tool_desc(b.get("arguments") or {})})
+            elif role == "toolResult":
+                events.append({"ts": ts, "kind": "tool_done", "id": msg.get("toolCallId")})
+    return events
+
+
+def sniff_kind(path) -> str:
+    if "/.codex/" in path or os.path.basename(path).startswith("rollout-"):
+        return "codex"
+    if "/.pi/" in path:
+        return "pi"
+    return "claude"
+
+
+READERS = {"claude": read_claude, "codex": read_codex, "pi": read_pi}
+
+
+def read_events(path, kind=None):
+    return READERS[kind or sniff_kind(path)](path)
+
+
+def _codex_files(days=3):
+    base = os.path.expanduser("~/.codex/sessions")
+    out = []
+    for i in range(days):
+        d = datetime.now() - timedelta(days=i)
+        out += glob.glob(os.path.join(base, d.strftime("%Y/%m/%d"), "rollout-*.jsonl"))
+    return out
+
+
+def _first_cwd(path, kind):
+    """cwd recorded at the top of a Codex or pi session file."""
+    try:
+        with open(path, errors="replace") as f:
+            for _ in range(5):
+                d = json.loads(f.readline() or "{}")
+                if kind == "codex" and d.get("type") == "session_meta":
+                    return (d.get("payload") or {}).get("cwd")
+                if kind == "pi" and d.get("type") == "session":
+                    return d.get("cwd")
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _recent(paths, days=3):
+    cutoff = time.time() - days * 86400
+    return [p for p in paths if os.path.getmtime(p) >= cutoff]
+
+
+def _all_candidates(agent=None):
+    out = []
+    if agent in (None, "claude"):
+        out += [(p, "claude") for p in _recent(glob.glob(os.path.expanduser(
+            "~/.claude/projects/*/*.jsonl")), 1)]
+    if agent in (None, "codex"):
+        out += [(p, "codex") for p in _codex_files(2)]
+    if agent in (None, "pi"):
+        out += [(p, "pi") for p in _recent(glob.glob(os.path.expanduser(
+            "~/.pi/agent/sessions/*/*.jsonl")), 1)]
+    return out
+
+
+def find_transcript(transcript=None, session=None, agent=None, cwd=None):
+    """Return (path, kind, how) for the live session, or (None, None, reason)."""
+    if transcript:
+        return os.path.expanduser(transcript), sniff_kind(transcript), "given"
+    cwd = cwd or os.getcwd()
+    sids = [s for s in (session, os.environ.get("CLAUDE_SESSION_ID"),
+                        os.environ.get("CODEX_THREAD_ID")) if s and "${" not in s and "$" not in s]
+    for sid in sids:
+        if agent in (None, "claude"):
+            hit = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{glob.escape(sid)}.jsonl"))
+            if hit:
+                return hit[0], "claude", "session id"
+        if agent in (None, "codex"):
+            hit = [p for p in _codex_files(30) if sid in os.path.basename(p)]
+            if hit:
+                return hit[0], "codex", "session id"
+        if agent in (None, "pi"):
+            hit = glob.glob(os.path.expanduser(f"~/.pi/agent/sessions/*/*{glob.escape(sid)}*.jsonl"))
+            if hit:
+                return hit[0], "pi", "session id"
+    cands = []
+    if agent in (None, "claude"):
+        slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+        cands += [(p, "claude") for p in glob.glob(
+            os.path.expanduser(f"~/.claude/projects/{glob.escape(slug)}/*.jsonl"))]
+    for p, k in _all_candidates(agent):
+        if k in ("codex", "pi") and _first_cwd(p, k) == cwd:
+            cands.append((p, k))
+    if cands:
+        p, k = max(cands, key=lambda c: os.path.getmtime(c[0]))
+        return p, k, "this folder's newest session"
+    # Last resort: whatever transcript is being written right now.
+    live = [c for c in _all_candidates(agent) if time.time() - os.path.getmtime(c[0]) < 180]
+    if live:
+        p, k = max(live, key=lambda c: os.path.getmtime(c[0]))
+        others = len(live) - 1
+        return p, k, ("newest live transcript (GUESS: " + (f"{others} other sessions also active, "
+                      if others else "") + "pass --session to be sure)")
+    return None, None, "no transcript found"
+
+
+# ---------------------------------------------------------------- measuring
+
+def reduce_todos(events, until):
+    """Replay todo/task events up to `until`. Returns (items{key:[label,status]}, done_times{key:ts})."""
+    items, done_at = {}, {}
+    for e in events:
+        if e["ts"] > until:
+            break
+        if e["kind"] == "todos":
+            new = {}
+            for key, label, st in e["items"]:
+                new[key] = [label, st]
+                if st == "done" and key not in done_at and items.get(key, [None, None])[1] != "done":
+                    done_at[key] = e["ts"]
+            items = new
+        elif e["kind"] == "task":
+            cur = items.setdefault(e["key"], [e.get("label") or "", "pending"])
+            if e.get("label"):
+                cur[0] = e["label"]
+            if e.get("status"):
+                if e["status"] == "deleted":
+                    items.pop(e["key"], None)
+                    continue
+                if e["status"] == "done" and cur[1] != "done":
+                    done_at[e["key"]] = e["ts"]
+                cur[1] = e["status"]
+    return items, done_at
+
+
+def history_spc():
+    xs = [p.get("spc") for p in load_jsonl(pred_path())
+          if p.get("spc") and p.get("pace_source") == "task"]
+    return statistics.median(xs[-30:]) if len(xs) >= 3 else None
+
+
+def measure(events, from_n=None, now=None, started=None, calls_done=None):
+    """Pace and progress for the current task. `started`/`calls_done` come from the agent itself
+    when no transcript is readable (or override what the transcript says)."""
+    now = now or time.time()
+    prompts = [e for e in events if e["kind"] == "prompt"]
+    end, eta_prompt = now, None
+    if prompts and prompts[-1]["eta"]:
+        eta_prompt = prompts[-1]
+        end = eta_prompt["ts"]
+    task_prompts = [p for p in prompts if not p["eta"] and p["ts"] <= end]
+    idx = max(1, min(from_n or 1, len(task_prompts))) if task_prompts else 0
+    task = task_prompts[-idx] if task_prompts else None
+    start = task["ts"] if task else (events[0]["ts"] if events else now)
+    if started:
+        start = started
+    win = [e for e in events if start <= e["ts"] <= end]
+
+    active = 0.0
+    for a, b in zip(win, win[1:]):
+        if b["kind"] == "prompt":      # waiting on the user is not working time
+            continue
+        active += min(b["ts"] - a["ts"], GAP_CAP)
+
+    starts = {e["id"]: e for e in win if e["kind"] == "tool"}
+    durs = {}
+    for e in win:
+        if e["kind"] == "tool_done" and e["id"] in starts:
+            durs[e["id"]] = e["ts"] - starts[e["id"]]["ts"]
+    calls = len(starts)
+    if calls_done is not None and (not events or calls_done > calls):
+        calls = calls_done
+        if not win:                 # self-reported: assume steady work since the start
+            active = max(0.0, end - start)
+    long_ops = sorted(((durs[i], starts[i]["name"], starts[i]["desc"])
+                       for i in durs if durs[i] >= LONG_OP), reverse=True)
+    long_total = sum(min(d, GAP_CAP) for d, _, _ in long_ops)
+    open_tools = [starts[i] for i in starts if i not in durs and now - starts[i]["ts"] >= 10]
+
+    hist = history_spc()
+    if calls >= MIN_CALLS and active > 0:
+        spc, pace_source = active / calls, "task"
+        core_n = calls - len(long_ops)
+        spc_core = (active - long_total) / core_n if core_n > 0 else spc
+    else:
+        spc = spc_core = hist or DEFAULT_SPC
+        pace_source = "history" if hist else "default"
+
+    items, done_at = reduce_todos(events, end)
+    n_done = sum(1 for v in items.values() if v[1] == "done")
+    n_doing = sum(1 for v in items.values() if v[1] == "doing")
+    n_pending = sum(1 for v in items.values() if v[1] == "pending")
+    done_in_win = sorted(t for k, t in done_at.items() if t >= start and k in items)
+    step_s = steps_eta = None
+    if done_in_win:
+        step_s = (done_in_win[-1] - start) / len(done_in_win)
+        steps_eta = step_s * (n_pending + 0.5 * n_doing)
+
+    recent = []
+    for i, p in enumerate(reversed(task_prompts[-6:]), 1):
+        recent.append({"n": i, "ts": p["ts"], "text": one_line(p["text"], 90)})
+
+    return {
+        "now": now, "start": start, "end": end,
+        "task": one_line(task["text"], 160) if task else None, "self_reported": not events,
+        "task_n": idx, "eta_prompt": eta_prompt is not None,
+        "elapsed": end - start, "active": active, "calls": calls,
+        "spc": spc, "spc_core": spc_core, "pace_source": pace_source,
+        "long_ops": [{"secs": d, "name": n, "desc": s} for d, n, s in long_ops[:5]],
+        "open_tools": [{"name": t["name"], "desc": t["desc"], "running": now - t["ts"]}
+                       for t in open_tools[-3:]],
+        "todos": {"done": n_done, "doing": n_doing, "pending": n_pending,
+                  "doing_labels": [one_line(v[0], 60) for v in items.values() if v[1] == "doing"],
+                  "pending_labels": [one_line(v[0], 60) for v in items.values() if v[1] == "pending"],
+                  "step_s": step_s, "steps_eta": steps_eta},
+        "recent_prompts": recent,
+        "last_event_age": now - events[-1]["ts"] if events else None,
+    }
+
+
+# ---------------------------------------------------------------- calibration
+
+def find_finish(pred, now):
+    """When did the work that `pred` was about actually stop? Returns (finish_ts|None, status)."""
+    path = pred.get("transcript")
+    if not path or not os.path.exists(path):
+        return None, ("lost" if now - pred["created"] > 2 * 86400 else "pending")
+    events = read_events(path, pred.get("kind"))
+    after = [e for e in events if e["ts"] > pred["created"] + 1]
+    nxt = next((e for e in after if e["kind"] == "prompt" and not e["eta"]), None)
+    if nxt:
+        body = [e for e in after if e["ts"] < nxt["ts"] and e["kind"] != "prompt"]
+    else:
+        last = events[-1]["ts"] if events else pred["created"]
+        if now - last < STALE and now - os.path.getmtime(path) < STALE:
+            return None, "pending"
+        body = [e for e in after if e["kind"] != "prompt"]
+    finish = body[-1]["ts"] if body else pred["created"]
+    actual = finish - pred["created"]
+    if actual < 30:
+        return finish, "inconclusive"      # agent stopped right after answering: no signal
+    if actual > 12 * 3600:
+        return finish, "abandoned"
+    return finish, "ok"
+
+
+def resolve_pending(now=None):
+    now = now or time.time()
+    done = {r["id"] for r in load_jsonl(res_path())}
+    for p in load_jsonl(pred_path()):
+        if p["id"] in done or p.get("raw_s", 0) < 60 or now - p["created"] < 60:
+            continue
+        try:
+            finish, status = find_finish(p, now)
+        except Exception as exc:  # never let one bad transcript break /eta
+            finish, status = None, f"error: {exc}"[:80]
+        if status == "pending":
+            continue
+        actual = (finish - p["created"]) if finish else None
+        append_jsonl(res_path(), {
+            "id": p["id"], "resolved": now, "status": status, "finish": finish,
+            "actual_s": actual, "ratio": (actual / p["raw_s"]) if actual and p.get("raw_s") else None,
+        })
+
+
+def calibration():
+    preds = {p["id"]: p for p in load_jsonl(pred_path())}
+    latest = {}
+    for r in load_jsonl(res_path()):
+        latest[r["id"]] = r
+    rows = []
+    for r in latest.values():
+        p = preds.get(r["id"])
+        if p and r.get("status") == "ok" and r.get("ratio"):
+            rows.append((p, r))
+    rows.sort(key=lambda pr: pr[0]["created"])
+    rows = rows[-CAL_WINDOW:]
+    ratios = [r["ratio"] for _, r in rows]
+    n = len(ratios)
+    hits = sum(1 for p, r in rows if p["low_s"] <= r["actual_s"] <= p["high_s"])
+    out = {"n": n, "factor": 1.0, "lo": DEFAULT_SPREAD[0], "hi": DEFAULT_SPREAD[1],
+           "hits": hits, "rows": rows}
+    if n >= MIN_CAL:
+        med = statistics.median(ratios)
+        out["factor"] = min(3.0, max(0.33, med))
+        if n >= 5:
+            out["lo"] = min(0.85, quantile(ratios, 0.2) / med)
+            out["hi"] = max(1.2, quantile(ratios, 0.8) / med)
+    return out
+
+
+# ---------------------------------------------------------------- commands
+
+def parse_started(v, now=None):
+    """'14:05', '2:05pm', '25m' / '1h10m' ago, or ISO -> epoch seconds."""
+    if not v:
+        return None
+    now = now or time.time()
+    v = v.strip().lower()
+    m = re.fullmatch(r"(?:(\d+)h)?\s*(?:(\d+)m(?:in)?)?(?:\s*ago)?", v)
+    if m and (m.group(1) or m.group(2)):
+        return now - int(m.group(1) or 0) * 3600 - int(m.group(2) or 0) * 60
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})\s*(am|pm)?", v)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if m.group(3) == "pm" and h < 12:
+            h += 12
+        if m.group(3) == "am" and h == 12:
+            h = 0
+        d = datetime.fromtimestamp(now).replace(hour=h, minute=mi, second=0, microsecond=0)
+        if d.timestamp() > now + 60:
+            d -= timedelta(days=1)
+        return d.timestamp()
+    ts = parse_ts(v.upper() if "t" in v else v)
+    if ts is None:
+        sys.exit(f"can't read --started {v!r}; use 14:05, 2:05pm, 25m, or an ISO time")
+    return ts
+
+
+def _load(args):
+    path, kind, how = find_transcript(args.transcript, args.session, args.agent)
+    args.found_how = how
+    if path and not os.path.exists(path):
+        sys.exit(f"transcript not found: {path}")
+    if not path:
+        return None, None, []
+    return path, kind, read_events(path, kind)
+
+
+def _measure(args, events, now=None):
+    return measure(events, args.from_n, now, parse_started(args.started, now), args.calls_done)
+
+
+def render_measure(path, m, cal, how="") -> str:
+    L = ["ETA MEASUREMENTS"]
+    if not path:
+        L.append("transcript: none readable for this harness, so this is self-reported mode.")
+        if m["calls"] == 0:
+            L.append("  Rerun with --started <when the task began, e.g. 14:05 or 25m> and "
+                     "--calls-done <tool calls you've made on it> from your own context.")
+    else:
+        L.append(f"transcript: {path}  (found by {how})")
+        if m["last_event_age"] and m["last_event_age"] > STALE:
+            L.append(f"WARNING: newest event is {fmt_dur(m['last_event_age'])} old; "
+                     "this may be the wrong session (pass --session or --transcript).")
+    if m["task"]:
+        L.append(f"task (prompt #{m['task_n']}): \"{m['task']}\"")
+        L.append(f"  started {fmt_clock(m['start'])}, {fmt_dur(m['elapsed'])} ago "
+                 f"({fmt_dur(m['active'])} active work)")
+    if len(m["recent_prompts"]) > 1:
+        L.append("recent prompts (if the task began earlier, rerun with --from N):")
+        for p in m["recent_prompts"]:
+            L.append(f"  [{p['n']}] {fmt_clock(p['ts'])}  {p['text']}")
+    L.append(f"tool calls so far: {m['calls']}")
+    src = {"task": "measured on this task", "history": "your median from past tasks",
+           "default": "default, nothing measured yet"}[m["pace_source"]]
+    L.append(f"pace: {m['spc']:.0f} s per call all-in, {m['spc_core']:.0f} s per call "
+             f"excluding long operations ({src})")
+    for op in m["long_ops"]:
+        L.append(f"  long op: {op['name']} {fmt_dur(op['secs'])}  {op['desc']}")
+    for t in m["open_tools"]:
+        L.append(f"  still running: {t['name']} for {fmt_dur(t['running'])}  {t['desc']}")
+    td = m["todos"]
+    if td["done"] + td["doing"] + td["pending"]:
+        L.append(f"todo list: {td['done']} done, {td['doing']} in progress, {td['pending']} pending")
+        for lab in td["doing_labels"]:
+            L.append(f"  doing: {lab}")
+        for lab in td["pending_labels"][:8]:
+            L.append(f"  next:  {lab}")
+        if td["steps_eta"] is not None:
+            L.append(f"  step pace {fmt_dur(td['step_s'])} per finished step -> "
+                     f"~{fmt_dur(td['steps_eta'])} left by step count (cross-check)")
+    if cal["n"] >= MIN_CAL:
+        L.append(f"calibration: {cal['n']} past ETAs checked; you finish at x{cal['factor']:.2f} "
+                 f"your raw estimate (median); {cal['hits']}/{cal['n']} landed inside the range")
+    else:
+        L.append(f"calibration: {cal['n']} past ETAs checked (needs {MIN_CAL}); no correction yet")
+    L.append("NEXT: list the remaining steps, count the tool calls each will really take "
+             "(include test runs, fixes, verification, commits), then run `estimate --calls N "
+             "[--wait-min M]` with the same --session/--from.")
+    return "\n".join(L)
+
+
+def cmd_measure(args):
+    resolve_pending()
+    path, kind, events = _load(args)
+    m = _measure(args, events)
+    cal = calibration()
+    if args.json:
+        cal = {k: v for k, v in cal.items() if k != "rows"}
+        print(json.dumps({"transcript": path, "kind": kind, "measure": m, "calibration": cal},
+                         indent=2))
+    else:
+        print(render_measure(path, m, cal, args.found_how))
+
+
+def cmd_estimate(args):
+    if args.calls is None and args.minutes is None:
+        sys.exit("estimate needs --calls N (preferred) or --minutes M")
+    resolve_pending()
+    path, kind, events = _load(args)
+    now = time.time()
+    m = _measure(args, events, now)
+    cal = calibration()
+    wait_s = (args.wait_min or 0) * 60
+    if args.calls is not None:
+        spc = m["spc_core"] if args.wait_min else m["spc"]
+        raw = args.calls * spc + wait_s
+        basis = f"{args.calls} tool calls x {spc:.0f} s"
+        if wait_s:
+            basis += f" + {fmt_dur(wait_s)} of waits"
+    else:
+        raw = args.minutes * 60 + wait_s
+        basis = f"agent judgment {fmt_dur(args.minutes * 60)}" + (
+            f" + {fmt_dur(wait_s)} of waits" if wait_s else "")
+    est = raw * cal["factor"]
+    low, high = est * cal["lo"], est * cal["hi"]
+    if cal["n"] >= 10 and cal["hi"] / cal["lo"] <= 2.5 and m["pace_source"] == "task":
+        conf = "high"
+    elif cal["n"] >= MIN_CAL or m["pace_source"] == "task":
+        conf = "medium"
+    else:
+        conf = "low"
+    pid = uuid.uuid4().hex[:12]
+    if not args.no_record:
+        append_jsonl(pred_path(), {
+            "id": pid, "created": now, "transcript": path, "kind": kind,
+            "session": os.path.splitext(os.path.basename(path))[0] if path else None,
+            "cwd": os.getcwd(), "task": m["task"], "task_start": m["start"],
+            "calls": args.calls, "minutes": args.minutes, "wait_s": wait_s,
+            "spc": m["spc"], "spc_core": m["spc_core"], "pace_source": m["pace_source"],
+            "raw_s": raw, "factor": cal["factor"], "n_cal": cal["n"],
+            "est_s": est, "low_s": low, "high_s": high, "note": args.note,
+        })
+    cal_txt = (f"calibration x{cal['factor']:.2f} from {cal['n']} past ETAs "
+               f"({cal['hits']}/{cal['n']} inside range)") if cal["n"] >= MIN_CAL else \
+        f"no calibration yet ({cal['n']}/{MIN_CAL} past ETAs checked)"
+    out = {
+        "id": pid, "remaining": fmt_dur(est), "low": fmt_dur(low), "high": fmt_dur(high),
+        "finish": fmt_clock(now + est, now), "finish_low": fmt_clock(now + low, now),
+        "finish_high": fmt_clock(now + high, now), "confidence": conf,
+        "basis": f"{basis} = {fmt_dur(raw)} raw; {cal_txt}",
+        "elapsed": fmt_dur(m["elapsed"]), "recorded": not args.no_record,
+    }
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return
+    print("ETA RESULT")
+    print(f"remaining:  ~{out['remaining']}  (likely {out['low']} to {out['high']})")
+    print(f"finish:     ~{out['finish']}  (between {out['finish_low']} and {out['finish_high']})")
+    print(f"confidence: {conf}")
+    print(f"basis:      {out['basis']}")
+    print(f"so far:     {out['elapsed']} on this task, {m['calls']} tool calls")
+    print(f"logged:     {'yes, id ' + pid if out['recorded'] else 'no (--no-record)'}")
+
+
+def cmd_done(args):
+    """The agent (or user) says the task is finished now: close its open predictions exactly."""
+    now = time.time()
+    path, kind, how = find_transcript(args.transcript, args.session, args.agent)
+    resolved = {r["id"] for r in load_jsonl(res_path()) if r.get("status") == "ok" and r.get("by") == "done"}
+    cwd = os.getcwd()
+    hits = []
+    for p in load_jsonl(pred_path()):
+        if p["id"] in resolved or now - p["created"] > 12 * 3600:
+            continue
+        same = (path and p.get("transcript") == path) or (
+            not path and not p.get("transcript") and p.get("cwd") == cwd)
+        if same:
+            hits.append(p)
+    for p in hits:
+        actual = now - p["created"]
+        append_jsonl(res_path(), {"id": p["id"], "resolved": now, "status": "ok", "by": "done",
+                                  "finish": now, "actual_s": actual,
+                                  "ratio": actual / p["raw_s"] if p.get("raw_s") else None})
+    if hits:
+        last = hits[-1]
+        print(f"marked done: {len(hits)} ETA(s) closed. Latest said {fmt_dur(last['est_s'])}, "
+              f"took {fmt_dur(now - last['created'])}.")
+    else:
+        print("nothing to close (no open ETA for this session in the last 12 h).")
+
+
+def cmd_stats(args):
+    resolve_pending()
+    cal = calibration()
+    preds = load_jsonl(pred_path())
+    res = {r["id"]: r for r in load_jsonl(res_path())}   # last resolution wins
+    print(f"ETA TRACK RECORD  ({len(preds)} logged, {cal['n']} checked against real finish times)")
+    if cal["n"]:
+        errs = [abs(r["actual_s"] - p["est_s"]) / max(r["actual_s"], 60) for p, r in cal["rows"]]
+        print(f"inside predicted range: {cal['hits']}/{cal['n']} "
+              f"({100 * cal['hits'] / cal['n']:.0f}%)   median error: {100 * statistics.median(errs):.0f}%")
+        print(f"current correction: x{cal['factor']:.2f}   range band: "
+              f"x{cal['lo']:.2f} to x{cal['hi']:.2f} around the estimate")
+    pending = [p for p in preds if p["id"] not in res and p.get("raw_s", 0) >= 60]
+    if pending:
+        print(f"waiting to be checked: {len(pending)}")
+    print()
+    print(f"{'when':<16} {'said':>8} {'range':>17} {'actual':>8}  hit  task")
+    for p in preds[-args.limit:]:
+        r = res.get(p["id"])
+        actual = fmt_dur(r["actual_s"]) if r and r.get("actual_s") and r["status"] == "ok" else (
+            r["status"] if r else "pending")
+        hit = ""
+        if r and r.get("status") == "ok":
+            hit = "yes" if p["low_s"] <= r["actual_s"] <= p["high_s"] else "no"
+        when = datetime.fromtimestamp(p["created"]).strftime("%m-%d %I:%M%p").lower()
+        rng = f"{fmt_dur(p['low_s'])}-{fmt_dur(p['high_s'])}"
+        print(f"{when:<16} {fmt_dur(p['est_s']):>8} {rng:>17} {actual:>8}  {hit:<4} "
+              f"{one_line(p.get('note') or p.get('task') or '', 50)}")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="eta", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(p):
+        p.add_argument("--session", help="session id (Claude Code: ${CLAUDE_SESSION_ID})")
+        p.add_argument("--transcript", help="explicit transcript .jsonl path")
+        p.add_argument("--agent", choices=["claude", "codex", "pi"],
+                       help="limit discovery to one harness")
+        p.add_argument("--from", dest="from_n", type=int,
+                       help="task started at recent prompt N (1 = latest non-ETA prompt)")
+        p.add_argument("--json", action="store_true")
+        p.add_argument("--started", help="any harness: when the task began (14:05, 2:05pm, 25m, ISO)")
+        p.add_argument("--calls-done", type=int, help="any harness: tool calls made on the task so far")
+
+    p = sub.add_parser("measure", help="read the live transcript and print pace + context")
+    common(p)
+    p.set_defaults(fn=cmd_measure)
+    p = sub.add_parser("estimate", help="compute, print and log the ETA")
+    common(p)
+    p.add_argument("--calls", type=int, help="tool calls still needed")
+    p.add_argument("--wait-min", type=float, help="known long waits (builds, downloads, CI), minutes")
+    p.add_argument("--minutes", type=float, help="direct estimate when calls can't be counted")
+    p.add_argument("--note", help="what is left, a few words")
+    p.add_argument("--no-record", action="store_true", help="don't log this prediction")
+    p.set_defaults(fn=cmd_estimate)
+    p = sub.add_parser("done", help="the task just finished: close its open ETAs (exact calibration)")
+    p.add_argument("--session")
+    p.add_argument("--transcript")
+    p.add_argument("--agent", choices=["claude", "codex", "pi"])
+    p.set_defaults(fn=cmd_done)
+    p = sub.add_parser("stats", help="past ETAs vs actual finish times")
+    p.add_argument("--limit", type=int, default=15)
+    p.set_defaults(fn=cmd_stats)
+
+    args = ap.parse_args(argv)
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
