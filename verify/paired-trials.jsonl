@@ -1,0 +1,27 @@
+{"trial": "median replay", "task": "coalesce", "method": "agent fallback", "issued": 1795540420.038327, "finished": 1795540426.9497442, "skill_s": 9.0, "agent_s": 9.0}
+{"trial": "median replay", "task": "unpack", "method": "agent fallback", "issued": 1795540429.062251, "finished": 1795540432.553097, "skill_s": 5.0, "agent_s": 5.0}
+{"trial": "median replay", "task": "windows", "method": "agent fallback", "issued": 1795540435.050594, "finished": 1795540439.1849458, "skill_s": 5.0, "agent_s": 5.0}
+{"trial": "median replay", "task": "dedup", "method": "historical median", "issued": 1795540441.37378, "finished": 1795540444.975095, "skill_s": 4.13435173034668, "agent_s": 4.0}
+{"trial": "median replay", "task": "gaps", "method": "historical median", "issued": 1795540447.23279, "finished": 1795540451.436438, "skill_s": 3.867833375930786, "agent_s": 6.0}
+{"trial": "median replay", "task": "bucket", "method": "historical median", "issued": 1795540453.64449, "finished": 1795540457.484714, "skill_s": 4.13435173034668, "agent_s": 4.0}
+{"trial": "median replay", "task": "overlay", "method": "historical median", "issued": 1795540461.025656, "finished": 1795540463.830954, "skill_s": 3.9872878789901733, "agent_s": 3.0}
+{"trial": "median replay", "task": "streak", "method": "historical median", "issued": 1795540466.209965, "finished": 1795540470.000959, "skill_s": 3.840224027633667, "agent_s": 4.0}
+{"trial": "median live", "task": "chunks", "method": "agent fallback", "issued": 1795540633.164545, "finished": 1795540636.522965, "skill_s": 3.7999999999999994, "agent_s": 3.7999999999999994}
+{"trial": "median live", "task": "runs", "method": "agent fallback", "issued": 1795540638.815561, "finished": 1795540642.205621, "skill_s": 3.6, "agent_s": 3.6}
+{"trial": "median live", "task": "transpose", "method": "agent fallback", "issued": 1795540644.5302138, "finished": 1795540647.762579, "skill_s": 3.0, "agent_s": 3.0}
+{"trial": "median live", "task": "rotate", "method": "historical median", "issued": 1795540650.198121, "finished": 1795540654.275413, "skill_s": 3.358419895172119, "agent_s": 3.3}
+{"trial": "median live", "task": "brackets", "method": "historical median", "issued": 1795540656.364696, "finished": 1795540660.096141, "skill_s": 3.374239921569824, "agent_s": 4.2}
+{"trial": "median live", "task": "span", "method": "historical median", "issued": 1795540662.625973, "finished": 1795540667.112997, "skill_s": 3.3900599479675293, "agent_s": 4.4}
+{"trial": "revised coding holdout", "task": "delta", "method": "agent and history", "issued": 1795540762.329244, "finished": 1795540765.676789, "skill_s": 3.3303762555122374, "agent_s": 3.1}
+{"trial": "revised coding holdout", "task": "rank", "method": "agent and history", "issued": 1795540768.437363, "finished": 1795540772.198702, "skill_s": 3.4450299739837646, "agent_s": 3.5}
+{"trial": "revised coding holdout", "task": "pairs", "method": "agent and history", "issued": 1795540774.7564108, "finished": 1795540777.9976552, "skill_s": 3.4303762555122375, "agent_s": 3.3}
+{"trial": "revised coding holdout", "task": "slugs", "method": "agent and history", "issued": 1795540780.666295, "finished": 1795540784.5550652, "skill_s": 3.895029973983765, "agent_s": 4.4}
+{"trial": "revised coding holdout", "task": "nearest", "method": "agent and history", "issued": 1795540786.674871, "finished": 1795540789.955185, "skill_s": 3.5303762555122375, "agent_s": 3.5}
+{"trial": "revised coding holdout", "task": "packrows", "method": "agent and history", "issued": 1795540794.7447839, "finished": 1795540798.829546, "skill_s": 3.4450299739837646, "agent_s": 3.5}
+{"trial": "revised coding holdout", "task": "prefix", "method": "agent and history", "issued": 1795540801.097573, "finished": 1795540806.799598, "skill_s": 3.4303762555122375, "agent_s": 3.3}
+{"trial": "revised coding holdout", "task": "weave", "method": "agent and history", "issued": 1795540810.720974, "finished": 1795540814.7171671, "skill_s": 3.9657225370407105, "agent_s": 4.2}
+{"trial": "short batches", "task": "alpha", "method": "measured progress", "issued": 1795540798.31951, "finished": 1795540821.502972, "skill_s": 23.787287664, "agent_s": 23.76}
+{"trial": "short batches", "task": "beta", "method": "measured progress", "issued": 1795540831.033628, "finished": 1795540856.355716, "skill_s": 26.479740319894738, "agent_s": 25.95}
+{"trial": "short batches", "task": "gamma", "method": "measured progress", "issued": 1795540865.417114, "finished": 1795540890.6332018, "skill_s": 25.47716502777778, "agent_s": 24.15}
+{"trial": "long batch", "task": "long", "method": "measured progress", "issued": 1795540950.909798, "finished": 1795541091.668986, "skill_s": 134.2003446875, "agent_s": 132.0}
+{"trial": "cold QA", "task": "mid-task QA", "method": "agent fallback", "issued": 1795540881.188402, "finished": 1795540893.677245, "skill_s": 45.0, "agent_s": 45.0}

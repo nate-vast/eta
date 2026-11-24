@@ -55,7 +55,7 @@ mkdir -p "$HOME/.eta"
 if [ "$MODE" = link ]; then
   ln -sfn "$SRC/scripts/eta.py" "$HOME/.eta/eta.py"
 else
-  rm -f "$HOME/.eta/eta.py"; cp "$SRC/scripts/eta.py" "$HOME/.eta/eta.py"
+  rm -f "$HOME/.eta/eta.py"; cp "$SRC/scripts/eta.py" "$SRC/scripts/job_history.py" "$HOME/.eta/"
 fi
 echo "script  ~/.eta/eta.py"
 

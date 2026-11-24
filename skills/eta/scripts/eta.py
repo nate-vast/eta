@@ -1,36 +1,23 @@
 #!/usr/bin/env python3
-"""eta: turn an agent's own transcript into a calibrated ETA for the current task.
+"""Estimate the working agent's remaining wall time and score it at completion.
 
-Agents guess wall-clock time badly. This script measures instead:
-  measure   read the live transcript: when the task started, active time, tool calls,
-            seconds per call, long operations, todo progress, past accuracy
-  estimate  remaining tool calls (+ known waits) x measured pace x calibration factor,
-            prints the ETA and logs the prediction
-  stats     how past ETAs compared with when the work really finished
-
-Calibration is automatic: every logged prediction is later checked against the
-transcript (the task is taken as finished when the agent's work stops before the
-next real user prompt), and the median actual/predicted ratio corrects new ETAs.
-
-Works with any agent in any harness:
-  - transcripts read automatically: Claude Code (~/.claude/projects), Codex (~/.codex/sessions),
-    pi (~/.pi/agent/sessions)
-  - anything else: the agent passes --started and --calls-done from its own context, and runs
-    `eta.py done` when it finishes so calibration still learns
-
-Stdlib only, Python 3.9+. Data lives in ~/.eta (override with ETA_HOME).
+The paired estimate uses measured batch progress or earlier confirmed comparable
+tasks. Legacy call-count estimates and transcript-based pace reports remain
+available. Local JSONL history lives in ~/.eta (override with ETA_HOME).
 """
 from __future__ import annotations
 
 import argparse
 import glob
 import json
+import math
 import os
 import re
 import statistics
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 GAP_CAP = 20 * 60          # a single quiet gap counts as at most this much active time
@@ -757,7 +744,201 @@ def cmd_measure(args):
         print(render_measure(path, m, cal, args.found_how, next_cmd))
 
 
+def paired_duration(seconds):
+    """Keep the displayed point estimate close to what gets scored."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remainder = divmod(round(seconds), 60)
+    return f"{minutes}m {remainder:02d}s"
+
+
+def confirmed_pairs():
+    """Original paired forecasts with explicit finish markers, joined once per id."""
+    resolutions = {r["id"]: r for r in load_jsonl(res_path())
+                   if r.get("by") == "done" and r.get("status") == "ok"}
+    return [(p, resolutions[p["id"]]) for p in load_jsonl(pred_path())
+            if p.get("agent_s") is not None and p["id"] in resolutions]
+
+
+def reference_scope(args):
+    return [os.path.realpath(os.getcwd()), args.agent or "other", args.model.strip().casefold()]
+
+
+def cmd_references(args):
+    scope = reference_scope(args)
+    labels = {p["cohort"][-1] for p, _ in confirmed_pairs() if p["cohort"][:-1] == scope}
+    print("\n".join(sorted(labels)) if labels else "No confirmed reference labels in this scope.")
+
+
+def reference_point(method, guess, samples):
+    """Forecast variable work; samples contain (agent seconds, actual seconds)."""
+    if method == "working agent":
+        return guess
+    if method == "agent and history":
+        return (guess + statistics.median(actual for _, actual in samples)) / 2
+    ratios = [actual / baseline for baseline, actual in samples if baseline > 0]
+    return guess * statistics.median(ratios) if ratios else guess
+
+
+def paired_forecast(pred, pairs):
+    """At most one observation per earlier task. Reference labels describe remaining work."""
+    by_run = {}
+    for old, result in pairs:
+        if (old["cohort"] != pred["cohort"] or old["run"] == pred["run"]
+                or result["resolved"] > pred["created"] or result["actual_s"] < old["wait_s"]):
+            continue
+        # Use the first forecast for that stage of each task, even for repeated check-ins.
+        if old["run"] not in by_run or old["created"] < by_run[old["run"]][0]["created"]:
+            by_run[old["run"]] = old, result
+    recent = sorted(by_run.values(), key=lambda pair: pair[1]["resolved"])[-CAL_WINDOW:]
+    wait = pred["wait_s"]
+    if pred.get("batch"):
+        completed, total, sample_s = pred["batch"]
+        remaining = sample_s * (total - completed) / completed
+        return dict(est_s=wait + remaining, low_s=wait + remaining * DEFAULT_SPREAD[0],
+                    high_s=wait + remaining * DEFAULT_SPREAD[1], n_cal=len(recent),
+                    method="measured progress", basis=f"{total - completed:g} units left at "
+                    f"{sample_s / completed:.2f}s per observed unit + {fmt_dur(wait)} of fixed waits")
+    if len(recent) < MIN_CAL:
+        point = max(wait, pred["agent_s"])
+        return dict(est_s=point, low_s=wait + (point - wait) * DEFAULT_SPREAD[0],
+                    high_s=wait + (point - wait) * DEFAULT_SPREAD[1], n_cal=len(recent),
+                    method="agent fallback", basis=f"working agent estimate; {len(recent)} comparable finishes")
+    samples = [(max(0, p["agent_s"] - p["wait_s"]), r["actual_s"] - p["wait_s"])
+               for p, r in recent]
+    guess = max(0, pred["agent_s"] - wait)
+    # Estimate each historical task without its own result. On tied error prefer
+    # the unadjusted agent. No outcome from the current task enters this choice.
+    errors = {}
+    for method in ("working agent", "agent and history", "agent bias correction"):
+        residuals = []
+        for i, (past_guess, actual) in enumerate(samples):
+            estimate = reference_point(method, past_guess, samples[:i] + samples[i + 1:])
+            residuals.append(actual - estimate)
+        errors[method] = residuals
+    method = min(errors, key=lambda name: sum(abs(e) for e in errors[name]))
+    point = reference_point(method, guess, samples)
+    low = max(0, point + min(0, quantile(errors[method], .1)))
+    high = point + max(0, quantile(errors[method], .9))
+    return dict(est_s=wait + point, low_s=wait + low, high_s=wait + high, n_cal=len(recent),
+                method=method, basis=f"{method}, selected by absolute error on {len(recent)} "
+                f"earlier comparable tasks; fixed wait {fmt_dur(wait)}")
+
+
+def apply_job_history(pred, args):
+    import job_history
+    import sqlite3
+
+    step = None
+    method = "job history"
+    if args.command is not None:
+        if args.elapsed_s is None or not args.agent:
+            sys.exit("--command needs --elapsed-s and --agent")
+        cwd = os.path.realpath(os.getcwd())
+        files = job_history.recent_project_files(args.agent, cwd)
+        durations = job_history.local_durations(((f, args.agent) for f in files),
+                                               cwd, args.command, pred["created"])
+        elapsed = args.elapsed_s
+        samples = job_history.remaining(durations, elapsed)
+    else:
+        if args.elapsed_s is not None:
+            sys.exit("--ci-job reads the attempt start time from GitHub; omit --elapsed-s")
+        try:
+            history = job_history.ci_history(args.ci_job, home(), pred["created"])
+            samples, elapsed, state = history.remaining, history.elapsed, history.state
+            step, method = history.step, history.method
+        except (OSError, KeyError, TypeError, ValueError, sqlite3.Error) as error:
+            pred["basis"] += f"; CI history unavailable ({type(error).__name__})"
+            return
+        if state != "running":
+            if state in ("queued", "waiting", "requested", "pending"):
+                pred["basis"] += f"; CI job {state}, check again when it starts"
+                return
+            return state
+    if len(samples) < MIN_CAL:
+        pred["basis"] += f"; only {len(samples)} comparable successful runs exceeded {elapsed:.0f}s"
+        return
+    match = f"matching step {step!r}" if step else f"still active at {elapsed:.0f}s"
+    tail = 60 * args.tail_min
+    extra = tail + pred["wait_s"]
+    point = statistics.median(samples)
+    estimate_basis = "median time left"
+    if step is not None:
+        guess = max(0, pred["agent_s"] - extra)
+        lower, upper = quantile(samples, .25), quantile(samples, .75)
+        if lower <= guess <= upper:
+            point = guess
+            estimate_basis = "agent estimate within the historical middle half"
+        elif history.late:
+            point = min(upper, max(lower, guess))
+            estimate_basis = "agent estimate bounded by late-step history"
+        elif history.elapsed_median is not None:
+            point = history.elapsed_median
+            estimate_basis = "whole-job median at the current elapsed time"
+    pred.update(est_s=extra + point, low_s=extra + min(point, quantile(samples, .1)),
+                high_s=extra + max(point, quantile(samples, .9)), method=method,
+                job_samples=len(samples), job_elapsed_s=elapsed, tail_s=tail,
+                basis=f"{len(samples)} prior successful runs {match}; "
+                      f"{estimate_basis} plus {paired_duration(extra)} for subsequent work and waits")
+
+
+def cmd_paired(args, now):
+    if not args.reference or not args.reference.strip() or not args.model or not args.model.strip():
+        sys.exit("--agent-min needs --reference (remaining work) and --model")
+    if args.calls is not None or args.minutes is not None:
+        sys.exit("use --agent-min on its own with --reference and --model")
+    if not args.task_id or not args.task_id.strip():
+        sys.exit("--agent-min needs --task-id; reuse the id for the same job across check-ins")
+    pid = uuid.uuid4().hex[:12]
+    batch = args.batch
+    if batch and (not all(math.isfinite(x) and x > 0 for x in batch) or batch[0] > batch[1]):
+        sys.exit("--batch needs positive completed units, total units and elapsed seconds (completed <= total)")
+    reference = " ".join(args.reference.casefold().split())
+    pred = dict(id=pid, created=now, batch=batch, agent_s=args.agent_min * 60,
+                wait_s=(args.wait_min or 0) * 60,
+                cohort=reference_scope(args) + [reference], run=args.task_id,
+                kind=args.agent, cwd=os.getcwd(),
+                note=args.note or reference)
+    pred.update(paired_forecast(pred, confirmed_pairs()))
+    pred["event"] = args.event
+    if args.command is not None or args.ci_job:
+        if args.tail_min is None:
+            sys.exit("specify --tail-min for work after the command (0 if its success completes the task)")
+        state = apply_job_history(pred, args)
+        if state:
+            message = f"CI job state: {state}. Reassess the remaining task before forecasting."
+            print(json.dumps({"state": state, "recorded": False, "message": message}) if args.json else message)
+            return
+    elif args.tail_min is not None or args.elapsed_s is not None:
+        sys.exit("--tail-min and --elapsed-s require a job history source")
+    if not args.no_record:
+        append_jsonl(pred_path(), pred)
+    out = dict(id=pid, remaining=paired_duration(pred["est_s"]), finish=fmt_clock(now + pred["est_s"], now),
+               low=paired_duration(pred["low_s"]), high=paired_duration(pred["high_s"]),
+               recorded=not args.no_record, **{k: pred[k] for k in
+               ("est_s", "agent_s", "low_s", "high_s", "method", "basis", "n_cal")})
+    if pred.get("job_samples") is not None:
+        out.update(job_samples=pred["job_samples"], job_elapsed_s=pred["job_elapsed_s"],
+                   tail_s=pred["tail_s"])
+    if args.json:
+        print(json.dumps(out, indent=2))
+    else:
+        print("ETA RESULT")
+        print(f"remaining: ~{out['remaining']} (finish ~{out['finish']})")
+        print(f"rough range: {out['low']} to {out['high']}")
+        print(f"basis: {out['basis']}")
+        if not args.no_record:
+            print(f"after verified completion: python3 ~/.eta/eta.py done --id {pid}")
+
+
 def cmd_estimate(args):
+    for value in (args.agent_min, args.wait_min, args.calls, args.minutes, args.elapsed_s, args.tail_min):
+        if value is not None and (not math.isfinite(value) or value < 0):
+            sys.exit("durations and call counts must be finite and nonnegative")
+    if args.agent_min is not None:
+        return cmd_paired(args, time.time())
+    if args.batch or args.reference or args.model or args.task_id or args.command or args.ci_job or args.tail_min is not None or args.elapsed_s is not None:
+        sys.exit("paired forecast options require --agent-min")
     if args.calls is None and args.minutes is None:
         sys.exit("estimate needs --calls N (preferred) or --minutes M")
     resolve_pending()
@@ -776,8 +957,9 @@ def cmd_estimate(args):
         raw = args.minutes * 60 + wait_s
         basis = f"agent judgment {fmt_dur(args.minutes * 60)}" + (
             f" + {fmt_dur(wait_s)} of waits" if wait_s else "")
-    est = raw * cal["factor"]
-    low, high = est * cal["lo"], est * cal["hi"]
+    work = max(0.0, raw - wait_s) * cal["factor"]
+    est = wait_s + work
+    low, high = wait_s + work * cal["lo"], wait_s + work * cal["hi"]
     if cal["n"] >= 10 and cal["hi"] / cal["lo"] <= 2.5 and m["pace_source"] == "task":
         conf = "high"
     elif cal["n"] >= MIN_CAL or m["pace_source"] == "task":
@@ -821,15 +1003,47 @@ def cmd_estimate(args):
           "/eta is a check-in, not a stop.")
 
 
+@contextmanager
+def finish_lock():
+    """Serialize simultaneous close notifications. The OS releases locks on exit."""
+    with open(os.path.join(home(), "done.lock"), "a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def cmd_done(args):
     """The agent (or user) says the task is finished now: close its open predictions exactly."""
     now = time.time()
+    if args.id:
+        predictions = {p["id"]: p for p in load_jsonl(pred_path())}
+        unknown = set(args.id) - predictions.keys()
+        if unknown:
+            sys.exit("unknown prediction id: " + ", ".join(sorted(unknown)))
+        with finish_lock():
+            closed = {r["id"] for r in load_jsonl(res_path()) if r.get("by") == "done"}
+            for pid in dict.fromkeys(args.id):
+                if pid in closed:
+                    print(f"{pid} already closed")
+                    continue
+                p = predictions[pid]
+                elapsed = now - p["created"]
+                append_jsonl(res_path(), dict(id=pid, resolved=now, finish=now, actual_s=elapsed,
+                                             status="ok", by="done",
+                                             ratio=elapsed / p["raw_s"] if p.get("raw_s") else None))
+                print(f"{pid} marked done: actual {fmt_dur(elapsed)}")
+        return
     path, kind, how = find_transcript(args.transcript, args.session, args.agent)
     resolved = {r["id"] for r in load_jsonl(res_path()) if r.get("status") == "ok" and r.get("by") == "done"}
     cwd = os.getcwd()
     hits = []
     for p in load_jsonl(pred_path()):
-        if p["id"] in resolved or now - p["created"] > 12 * 3600:
+        if p.get("agent_s") is not None or p["id"] in resolved or now - p["created"] > 12 * 3600:
             continue
         same = (path and p.get("transcript") == path) or (
             not path and not p.get("transcript") and p.get("cwd") == cwd)
@@ -853,7 +1067,24 @@ def cmd_stats(args):
     cal = calibration()
     preds = load_jsonl(pred_path())
     res = {r["id"]: r for r in load_jsonl(res_path())}   # last resolution wins
-    print(f"ETA TRACK RECORD  ({len(preds)} logged, {cal['n']} checked against real finish times)")
+    print(f"ETA TRACK RECORD  ({len(preds)} logged, {cal['n']} scored by legacy calibration)")
+    pairs = confirmed_pairs()
+    paired_count = sum(p.get("agent_s") is not None for p in preds)
+    if paired_count:
+        print(f"confirmed paired outcomes: {len(pairs)}/{paired_count}; "
+              f"{paired_count - len(pairs)} awaiting verified completion")
+    if pairs:
+        skill = [abs(p["est_s"] - r["actual_s"]) for p, r in pairs]
+        agent = [abs(p["agent_s"] - r["actual_s"]) for p, r in pairs]
+        wins = sum(x < y for x, y in zip(skill, agent))
+        ties = sum(x == y for x, y in zip(skill, agent))
+        print(f"paired forecasts: {len(pairs)} explicitly closed; mean absolute error "
+              f"skill {statistics.mean(skill):.1f}s, agent {statistics.mean(agent):.1f}s; "
+              f"{wins} wins, {ties} ties, {len(pairs)-wins-ties} losses")
+        hits = sum(p["low_s"] <= r["actual_s"] <= p["high_s"] for p, r in pairs)
+        print(f"paired range coverage {hits}/{len(pairs)}; median absolute miss "
+              f"skill {statistics.median(skill)/60:.2f}m, agent {statistics.median(agent)/60:.2f}m; "
+              f"worst miss skill {max(skill)/60:.2f}m, agent {max(agent)/60:.2f}m")
     if cal["n"]:
         errs = [abs(r["actual_s"] - p["est_s"]) / max(r["actual_s"], 60) for p, r in cal["rows"]]
         print(f"inside predicted range: {cal['hits']}/{cal['n']} "
@@ -868,7 +1099,8 @@ def cmd_stats(args):
     for p in preds[-args.limit:]:
         r = res.get(p["id"])
         actual = fmt_dur(r["actual_s"]) if r and r.get("actual_s") and r["status"] == "ok" else (
-            r["status"] if r else ("too short" if p.get("raw_s", 0) < 60 else "pending"))
+            r["status"] if r else ("awaiting done" if p.get("agent_s") is not None else
+             "too short" if p.get("raw_s", 0) < 60 else "pending"))
         hit = ""
         if r and r.get("status") == "ok":
             hit = "yes" if p["low_s"] <= r["actual_s"] <= p["high_s"] else "no"
@@ -898,6 +1130,18 @@ def main(argv=None):
     p.set_defaults(fn=cmd_measure)
     p = sub.add_parser("estimate", help="compute, print and log the ETA")
     common(p)
+    p.add_argument("--agent-min", type=float, help="working agent's independent total remaining minutes")
+    p.add_argument("--reference", help="repeatable description of the remaining work and its scale")
+    p.add_argument("--model", help="working agent model identity")
+    sources = p.add_mutually_exclusive_group()
+    sources.add_argument("--command", help="exact local shell command, measured from project transcripts")
+    sources.add_argument("--ci-job", help="GitHub Actions job URL")
+    p.add_argument("--elapsed-s", type=float, help="observed time since this command attempt started")
+    p.add_argument("--tail-min", type=float, help="estimated work after successful job completion")
+    p.add_argument("--event", default="check-in", choices=["check-in", "started", "retry", "overrun", "scope-change"])
+    sources.add_argument("--batch", type=float, nargs=3, metavar=("DONE", "TOTAL", "SECONDS"),
+                   help="homogeneous batch accounting for all variable work: observed units done, total, elapsed seconds")
+    p.add_argument("--task-id", help="stable identifier across forecasts for one task")
     p.add_argument("--calls", type=int, help="tool calls still needed")
     p.add_argument("--wait-min", type=float, help="known long waits (builds, downloads, CI), minutes")
     p.add_argument("--minutes", type=float, help="direct estimate when calls can't be counted")
@@ -908,7 +1152,12 @@ def main(argv=None):
     p.add_argument("--session")
     p.add_argument("--transcript")
     p.add_argument("--agent", choices=["claude", "codex", "pi"])
+    p.add_argument("--id", nargs="+", help="explicitly close these verified predictions")
     p.set_defaults(fn=cmd_done)
+    p = sub.add_parser("references", help="show this model's confirmed remaining-work labels in this project")
+    p.add_argument("--agent", choices=["claude", "codex", "pi"])
+    p.add_argument("--model", required=True)
+    p.set_defaults(fn=cmd_references)
     p = sub.add_parser("stats", help="past ETAs vs actual finish times")
     p.add_argument("--limit", type=int, default=15)
     p.set_defaults(fn=cmd_stats)

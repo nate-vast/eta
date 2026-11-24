@@ -1,0 +1,211 @@
+{
+  "repository": "pytest-dev/pytest",
+  "workflow": 22158026,
+  "branch": "main",
+  "event": "push",
+  "cutoff": "2026-11-19T07:21:34Z",
+  "training_runs": [
+    41042286270,
+    41340478243,
+    41397398750,
+    41483953988,
+    41547626251,
+    41800583479,
+    42345309053,
+    42458116507,
+    42695496981,
+    42714614972,
+    42765966783,
+    43016645005,
+    43723032371,
+    44006667926,
+    44356430471,
+    44477186064,
+    44478752534,
+    44478902483
+  ],
+  "held_out_runs": [
+    44478989421,
+    44479187911,
+    44479254711,
+    44899320365,
+    45001104775,
+    45339033553
+  ],
+  "forecasts": [
+    {
+      "job": "build (windows-py311)",
+      "elapsed": 120,
+      "prior_successful_durations_s": [
+        423,
+        427,
+        459,
+        426,
+        417,
+        434,
+        409,
+        424,
+        393,
+        389,
+        425,
+        419,
+        356,
+        421,
+        473,
+        375
+      ],
+      "agent_s": 302
+    },
+    {
+      "job": "build (windows-py311)",
+      "elapsed": 240,
+      "prior_successful_durations_s": [
+        423,
+        427,
+        459,
+        426,
+        417,
+        434,
+        409,
+        424,
+        393,
+        389,
+        425,
+        419,
+        356,
+        421,
+        473,
+        375
+      ],
+      "agent_s": 182
+    },
+    {
+      "job": "build (ubuntu-py312)",
+      "elapsed": 120,
+      "prior_successful_durations_s": [
+        348,
+        596,
+        621,
+        567,
+        362,
+        553,
+        599,
+        530,
+        455,
+        494,
+        557,
+        488,
+        555,
+        520,
+        462,
+        600
+      ],
+      "agent_s": 422
+    },
+    {
+      "job": "build (ubuntu-py312)",
+      "elapsed": 240,
+      "prior_successful_durations_s": [
+        348,
+        596,
+        621,
+        567,
+        362,
+        553,
+        599,
+        530,
+        455,
+        494,
+        557,
+        488,
+        555,
+        520,
+        462,
+        600
+      ],
+      "agent_s": 302
+    }
+  ],
+  "outcomes": [
+    {
+      "run": 44478989421,
+      "job": "build (windows-py311)",
+      "url": "https://github.com/pytest-dev/pytest/actions/runs/44478989421/job/135406571493",
+      "start": "2026-11-19T07:23:02Z",
+      "end": "2026-11-19T07:23:12Z",
+      "state": "cancelled"
+    },
+    {
+      "run": 44478989421,
+      "job": "build (ubuntu-py312)",
+      "url": "https://github.com/pytest-dev/pytest/actions/runs/44478989421/job/135406571561",
+      "start": "2026-11-19T07:22:08Z",
+      "end": "2026-11-19T07:23:22Z",
+      "state": "cancelled"
+    },
+    {
+      "run": 44479254711,
+      "job": "build (windows-py311)",
+      "url": "https://github.com/pytest-dev/pytest/actions/runs/44479254711/job/135407758155",
+      "start": "2026-11-19T07:28:23Z",
+      "end": "2026-11-19T07:35:42Z",
+      "state": "success"
+    },
+    {
+      "run": 44479254711,
+      "job": "build (ubuntu-py312)",
+      "url": "https://github.com/pytest-dev/pytest/actions/runs/44479254711/job/135407758519",
+      "start": "2026-11-19T07:33:00Z",
+      "end": "2026-11-19T07:41:57Z",
+      "state": "success"
+    },
+    {
+      "run": 44899320365,
+      "job": "build (windows-py311)",
+      "url": "https://github.com/pytest-dev/pytest/actions/runs/44899320365/job/136831790631",
+      "start": "2026-11-21T11:29:38Z",
+      "end": "2026-11-21T11:35:52Z",
+      "state": "success"
+    },
+    {
+      "run": 44899320365,
+      "job": "build (ubuntu-py312)",
+      "url": "https://github.com/pytest-dev/pytest/actions/runs/44899320365/job/136831790780",
+      "start": "2026-11-21T11:31:50Z",
+      "end": "2026-11-21T11:38:23Z",
+      "state": "success"
+    },
+    {
+      "run": 45001104775,
+      "job": "build (windows-py311)",
+      "url": "https://github.com/pytest-dev/pytest/actions/runs/45001104775/job/137142665767",
+      "start": "2026-11-22T08:04:59Z",
+      "end": "2026-11-22T08:09:44Z",
+      "state": "success"
+    },
+    {
+      "run": 45001104775,
+      "job": "build (ubuntu-py312)",
+      "url": "https://github.com/pytest-dev/pytest/actions/runs/45001104775/job/137142665887",
+      "start": "2026-11-22T08:04:59Z",
+      "end": "2026-11-22T08:13:07Z",
+      "state": "success"
+    },
+    {
+      "run": 45339033553,
+      "job": "build (windows-py311)",
+      "url": "https://github.com/pytest-dev/pytest/actions/runs/45339033553/job/138258088395",
+      "start": "2026-11-24T06:17:05Z",
+      "end": "2026-11-24T06:23:06Z",
+      "state": "success"
+    },
+    {
+      "run": 45339033553,
+      "job": "build (ubuntu-py312)",
+      "url": "https://github.com/pytest-dev/pytest/actions/runs/45339033553/job/138258088438",
+      "start": "2026-11-24T06:20:09Z",
+      "end": "2026-11-24T06:27:41Z",
+      "state": "success"
+    }
+  ]
+}
