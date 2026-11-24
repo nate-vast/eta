@@ -4,6 +4,8 @@ import os
 import re
 import sqlite3
 import subprocess
+from statistics import median
+from typing import NamedTuple, Optional
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlencode, urlsplit
@@ -145,6 +147,62 @@ def gh(endpoint):
     return json.loads(proc.stdout)
 
 
+class CIHistory(NamedTuple):
+    remaining: list
+    elapsed: float
+    state: str
+    step: Optional[str] = None
+    method: str = "job history"
+    late: bool = False
+    elapsed_median: Optional[float] = None
+
+
+def ci_samples(history, elapsed, active):
+    """Project from a matching observed step when at least five past jobs qualify.
+
+    Step timings are offsets from job start. Only the current step's identity and
+    start are observed in the target job.
+    """
+    baseline = remaining([duration for duration, _ in history], elapsed)
+    if active:
+        number, name, started = active
+        age = elapsed - started
+        samples = []
+        fractions = []
+        for duration, steps in history:
+            for n, label, begin, end in steps:
+                if n == number and label == name and 0 <= age < end - begin and 0 <= begin < end <= duration:
+                    fractions.append(begin / duration)
+                    samples.append(duration - begin - age)
+                    break
+        if len(samples) >= 5:
+            return CIHistory(sorted(samples), elapsed, "running", name, "CI step history",
+                             median(fractions) >= .8, median(baseline) if len(baseline) >= 3 else None)
+    return CIHistory(baseline, elapsed, "running")
+
+
+def completed_steps(job):
+    start = job.get("started_at")
+    if not start:
+        return []
+    return [(s["number"], s["name"], epoch(s["started_at"]) - epoch(start),
+             epoch(s["completed_at"]) - epoch(start))
+            for s in job.get("steps", []) if s.get("started_at") and s.get("completed_at")
+            and s.get("conclusion") == "success"]
+
+
+def attempt_jobs(endpoint):
+    page = 1
+    jobs = []
+    while True:
+        batch = gh(f"{endpoint}?per_page=100&page={page}")["jobs"]
+        jobs.extend((j["name"], j["conclusion"], j["started_at"], j["completed_at"], completed_steps(j))
+                    for j in batch)
+        if len(batch) < 100:
+            return jobs
+        page += 1
+
+
 def ci_history(url, cache_dir, now):
     match = re.fullmatch(r"https://github\.com/([\w.-]+/[\w.-]+)/actions/runs/(\d+)/job/(\d+)/?", url)
     if not match:
@@ -155,7 +213,7 @@ def ci_history(url, cache_dir, now):
     if str(job["run_id"]) != run_id:
         raise ValueError("job and workflow run differ")
     if job["status"] != "in_progress" or not job.get("started_at"):
-        return [], None, job.get("conclusion") or job["status"]
+        return CIHistory([], 0, job.get("conclusion") or job["status"])
     run = gh(f"{api}/runs/{run_id}")
     start = epoch(job["started_at"])
     params = urlencode(dict(branch=run["head_branch"], event=run["event"], status="completed", per_page=25))
@@ -165,32 +223,28 @@ def ci_history(url, cache_dir, now):
     observed = []
     try:
         with db:
-            db.execute("CREATE TABLE IF NOT EXISTS attempts (key TEXT PRIMARY KEY, data TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS step_attempts (key TEXT PRIMARY KEY, data TEXT NOT NULL)")
             for old in runs:
                 if str(old["id"]) == run_id or epoch(old["created_at"]) >= start:
                     continue
                 endpoint = f"{api}/runs/{old['id']}/attempts/{old['run_attempt']}/jobs"
-                cached = db.execute("SELECT data FROM attempts WHERE key=?", (endpoint,)).fetchone()
+                cached = db.execute("SELECT data FROM step_attempts WHERE key=?", (endpoint,)).fetchone()
                 if cached:
                     jobs = json.loads(cached[0])
                 else:
-                    jobs = []
-                    page = 1
-                    while True:
-                        batch = gh(f"{endpoint}?per_page=100&page={page}")["jobs"]
-                        jobs.extend((j["name"], j["conclusion"], j["started_at"], j["completed_at"])
-                                    for j in batch)
-                        if len(batch) < 100:
-                            break
-                        page += 1
-                    db.execute("INSERT OR IGNORE INTO attempts VALUES (?,?)", (endpoint,json.dumps(jobs)))
-                for name, status, began, ended in jobs:
+                    jobs = attempt_jobs(endpoint)
+                    db.execute("INSERT OR IGNORE INTO step_attempts VALUES (?,?)", (endpoint,json.dumps(jobs)))
+                for name, status, began, ended, steps in jobs:
                     if name == job["name"] and status == "success" and ended and began and epoch(ended) < start:
-                        observed.append(epoch(ended)-epoch(began))
+                        observed.append((epoch(ended) - epoch(began), steps))
     finally:
         db.close()
     # A first lookup can take several API calls. Check for a finish during the lookup.
     latest = gh(f"{api}/jobs/{job_id}")
     if latest["status"] != "in_progress":
-        return [], None, latest.get("conclusion") or latest["status"]
-    return observed, max(0, now - start), "running"
+        return CIHistory([], 0, latest.get("conclusion") or latest["status"])
+    active = next(((s["number"], s["name"], epoch(s["started_at"]) - start)
+                   for s in job.get("steps", []) if s.get("status") == "in_progress"
+                   and s.get("started_at") and start <= epoch(s["started_at"]) <= now), None)
+    elapsed = max(0, now - start)
+    return ci_samples(observed, elapsed, active)

@@ -25,7 +25,7 @@ def main():
             age = c["elapsed"]
             if c["job"] != obs["job"] or age >= duration:
                 continue
-            historical = c["prior_successful_durations_s"], age, "running"
+            historical = job_history.CIHistory(job_history.remaining(c["prior_successful_durations_s"], age), age, "running")
             with patch.object(job_history, "ci_history", return_value=historical), \
                     patch.object(eta, "confirmed_pairs", return_value=[]), \
                     contextlib.redirect_stdout(io.StringIO()) as out:

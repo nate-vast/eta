@@ -47,6 +47,39 @@ class History(Base):
         self.assertEqual(list(jobs.shell_samples(p, "pi", "/p", "make", 200)), [])
         self.assertEqual([sec for _, sec in jobs.shell_samples(p, "pi", "/other", "make", 200)], [7])
 
+    def test_step_forecast_includes_downstream_work_and_excludes_finished_steps(self):
+        # Current step began at 200s and has run for 40s. Its three historical
+        # starts differed; the rest of the job after each matched point matters.
+        past = [(300, [(3, "tests", 100, 180)]), (360, [(3, "tests", 140, 210)]),
+                (320, [(3, "tests", 120, 210)]), (900, [(3, "tests", 100, 139)])]
+        past += past[:2]
+        result = jobs.ci_samples(past, 240, (3, "tests", 200))
+        self.assertEqual(result.remaining, [160, 160, 160, 180, 180])
+        self.assertEqual(result.step, "tests")
+        self.assertIsNone(jobs.ci_samples(past, 240, (4, "tests", 200)).step)
+        self.assertIsNone(jobs.ci_samples(past[:2], 240, (3, "tests", 200)).step)
+
+    def test_step_bound_preserves_in_band_guess_and_tail(self):
+        history = jobs.CIHistory([10,20,30,40,50], 240, "running", "Publish", "CI step history", late=True)
+        argv = ["estimate","--model","m","--reference","publish","--task-id","t","--ci-job","url",
+                "--tail-min","1","--json","--no-record"]
+        with patch.object(jobs, "ci_history", return_value=history):
+            for guess, expected in [(1.5,90), (1,80), (2,100)]:
+                self.assertEqual(json.loads(run(argv + ["--agent-min",str(guess)]))["est_s"],expected)
+
+    def test_early_outliers_use_elapsed_median_or_step_median(self):
+        argv = ["estimate", "--model", "m", "--reference", "tests", "--task-id", "t",
+                "--ci-job", "url", "--tail-min", "1", "--wait-min", ".5", "--json", "--no-record"]
+        for baseline, expected in [(80, 170), (None, 120)]:
+            history = jobs.CIHistory([10, 20, 30, 40, 50], 240, "running", "Tests",
+                                     "CI step history", elapsed_median=baseline)
+            with patch.object(jobs, "ci_history", return_value=history):
+                for guess in ["1.6", "4"]:
+                    pred = json.loads(run(argv + ["--agent-min", guess]))
+                    self.assertEqual(pred["est_s"], expected)
+                    self.assertLessEqual(pred["est_s"], pred["high_s"])
+                self.assertEqual(json.loads(run(argv + ["--agent-min", "2"]))["est_s"], 120)
+
     def test_ci_fetch_and_cache(self):
         job = dict(run_id=9, name="tests", status="in_progress", started_at=iso(1000))
         calls = []
@@ -61,10 +94,10 @@ class History(Base):
         url = "https://github.com/o/r/actions/runs/9/job/42"
         with patch.object(jobs, "gh", side_effect=api):
             for _ in range(2):
-                durations, elapsed, state = jobs.ci_history(url,self.tmp.name,1010)
-                self.assertEqual((durations,elapsed,state), ([60],10,"running"))
+                result = jobs.ci_history(url,self.tmp.name,1010)
+                self.assertEqual((result.remaining,result.elapsed,result.state,result.step), ([50],10,"running",None))
             self.assertEqual(sum("/attempts/2/jobs" in c for c in calls),1)
             job["status"] = "queued"
-            self.assertEqual(jobs.ci_history(url,self.tmp.name,1010),([],None,"queued"))
+            self.assertEqual(jobs.ci_history(url,self.tmp.name,1010),jobs.CIHistory([],0,"queued"))
             job.update(status="completed",conclusion="failure")
-            self.assertEqual(jobs.ci_history(url,self.tmp.name,1010),([],None,"failure"))
+            self.assertEqual(jobs.ci_history(url,self.tmp.name,1010),jobs.CIHistory([],0,"failure"))

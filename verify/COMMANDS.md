@@ -24,3 +24,33 @@ Both agents locked their own estimates before the outcome. Neither task had comp
 | Diagnose local transcript timing with three harness fixtures | 4m 00s | 1m 47s | 2m 13s |
 
 The debugging case includes the server restart. Its original prediction was closed after the resumed worker verified the fix. The implementation finish was recorded after integration and regression checks, before writing this report and pushing the branch. The trial provides no evidence of an advantage for open-ended work. These results are separate from the earlier short-task study.
+
+## GitHub Actions step timing
+
+Four chronological replays used disjoint groups of 30 historical pytest main-branch push workflow runs. Each used the first 20 runs for historical observations available before the cutoff and the last ten as targets. Forecasts refer to the successful job finishing, with zero downstream task time. Absolute error is measured in wall-clock seconds.
+
+- At four minutes, the median for matching steps missed by 86.50s on average over 20 jobs, against 85.65s for elapsed-time history. Adding sibling-job speed in a separate 16-job trial missed by 63.29s against 53.06s. Both variants were discarded.
+- On the third group, bounding every guess by the middle half of matching step durations improved cleanup forecasts, but the resulting ordinary-agent forecast at four minutes missed by 104.38s against 31.88s for elapsed-time history.
+- The final rule accepts in-band guesses. For outside guesses it uses elapsed-time history during earlier steps (matching step median if fewer than three elapsed-time observations qualify). For steps that historically start at or after 80% of job duration by median, it uses the nearer quartile. Both require five matching step observations. The rule was fixed before scoring the final group.
+
+Final group, 16 successful jobs checked twice. Each checkpoint type and information condition had its own blinded agent. Ordinary agents saw the current job and step timing. Informed agents also saw the historical records. Each row reports mean absolute error in seconds.
+
+| Information available to agent | Checkpoint | Agent | Prior release | Updated skill |
+|---|---|---:|---:|---:|
+| Current job | Four minutes | 110.56 | 44.25 | 44.25 |
+| Current job | First cleanup step | 11.00 | 33.12 | 1.69 |
+| Current job | Both | 60.78 | 38.69 | 22.97 |
+| Current job and history | Four minutes | 47.88 | 44.25 | 47.88 |
+| Current job and history | First cleanup step | 1.50 | 33.06 | 1.50 |
+| Current job and history | Both | 24.69 | 38.66 | 24.69 |
+
+The update was closer than the ordinary agent at 28 checkpoints and further at four. It tied the informed agent at every checkpoint. The prior release falls back to the supplied guess with sparse history, so its scores can differ between conditions. These checkpoints share jobs and a workflow. They measure CI wait time and do not establish an advantage on open-ended development.
+
+Reproduce the four trials, in order, with:
+
+```sh
+python3 verify/score_steps.py
+python3 verify/score_steps.py ci-peers.json
+python3 verify/score_ci_band.py ci-band.json
+python3 verify/score_ci_band.py
+```

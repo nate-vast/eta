@@ -829,6 +829,8 @@ def apply_job_history(pred, args):
     import job_history
     import sqlite3
 
+    step = None
+    method = "job history"
     if args.command is not None:
         if args.elapsed_s is None or not args.agent:
             sys.exit("--command needs --elapsed-s and --agent")
@@ -837,11 +839,14 @@ def apply_job_history(pred, args):
         durations = job_history.local_durations(((f, args.agent) for f in files),
                                                cwd, args.command, pred["created"])
         elapsed = args.elapsed_s
+        samples = job_history.remaining(durations, elapsed)
     else:
         if args.elapsed_s is not None:
             sys.exit("--ci-job reads the attempt start time from GitHub; omit --elapsed-s")
         try:
-            durations, elapsed, state = job_history.ci_history(args.ci_job, home(), pred["created"])
+            history = job_history.ci_history(args.ci_job, home(), pred["created"])
+            samples, elapsed, state = history.remaining, history.elapsed, history.state
+            step, method = history.step, history.method
         except (OSError, KeyError, TypeError, ValueError, sqlite3.Error) as error:
             pred["basis"] += f"; CI history unavailable ({type(error).__name__})"
             return
@@ -850,17 +855,31 @@ def apply_job_history(pred, args):
                 pred["basis"] += f"; CI job {state}, check again when it starts"
                 return
             return state
-    samples = job_history.remaining(durations, elapsed)
     if len(samples) < MIN_CAL:
         pred["basis"] += f"; only {len(samples)} comparable successful runs exceeded {elapsed:.0f}s"
         return
+    match = f"matching step {step!r}" if step else f"still active at {elapsed:.0f}s"
     tail = 60 * args.tail_min
     extra = tail + pred["wait_s"]
-    pred.update(est_s=extra + statistics.median(samples), low_s=extra + quantile(samples, .1),
-                high_s=extra + quantile(samples, .9), method="job history",
+    point = statistics.median(samples)
+    estimate_basis = "median time left"
+    if step is not None:
+        guess = max(0, pred["agent_s"] - extra)
+        lower, upper = quantile(samples, .25), quantile(samples, .75)
+        if lower <= guess <= upper:
+            point = guess
+            estimate_basis = "agent estimate within the historical middle half"
+        elif history.late:
+            point = min(upper, max(lower, guess))
+            estimate_basis = "agent estimate bounded by late-step history"
+        elif history.elapsed_median is not None:
+            point = history.elapsed_median
+            estimate_basis = "whole-job median at the current elapsed time"
+    pred.update(est_s=extra + point, low_s=extra + min(point, quantile(samples, .1)),
+                high_s=extra + max(point, quantile(samples, .9)), method=method,
                 job_samples=len(samples), job_elapsed_s=elapsed, tail_s=tail,
-                basis=f"{len(samples)} prior successful runs still active at {elapsed:.0f}s; "
-                      f"median time left plus {paired_duration(extra)} for subsequent work and waits")
+                basis=f"{len(samples)} prior successful runs {match}; "
+                      f"{estimate_basis} plus {paired_duration(extra)} for subsequent work and waits")
 
 
 def cmd_paired(args, now):
