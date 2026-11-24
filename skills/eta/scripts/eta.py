@@ -825,6 +825,44 @@ def paired_forecast(pred, pairs):
                 f"earlier comparable tasks; fixed wait {fmt_dur(wait)}")
 
 
+def apply_job_history(pred, args):
+    import job_history
+    import sqlite3
+
+    if args.command is not None:
+        if args.elapsed_s is None or not args.agent:
+            sys.exit("--command needs --elapsed-s and --agent")
+        cwd = os.path.realpath(os.getcwd())
+        files = job_history.recent_project_files(args.agent, cwd)
+        durations = job_history.local_durations(((f, args.agent) for f in files),
+                                               cwd, args.command, pred["created"])
+        elapsed = args.elapsed_s
+    else:
+        if args.elapsed_s is not None:
+            sys.exit("--ci-job reads the attempt start time from GitHub; omit --elapsed-s")
+        try:
+            durations, elapsed, state = job_history.ci_history(args.ci_job, home(), pred["created"])
+        except (OSError, KeyError, TypeError, ValueError, sqlite3.Error) as error:
+            pred["basis"] += f"; CI history unavailable ({type(error).__name__})"
+            return
+        if state != "running":
+            if state in ("queued", "waiting", "requested", "pending"):
+                pred["basis"] += f"; CI job {state}, check again when it starts"
+                return
+            return state
+    samples = job_history.remaining(durations, elapsed)
+    if len(samples) < MIN_CAL:
+        pred["basis"] += f"; only {len(samples)} comparable successful runs exceeded {elapsed:.0f}s"
+        return
+    tail = 60 * args.tail_min
+    extra = tail + pred["wait_s"]
+    pred.update(est_s=extra + statistics.median(samples), low_s=extra + quantile(samples, .1),
+                high_s=extra + quantile(samples, .9), method="job history",
+                job_samples=len(samples), job_elapsed_s=elapsed, tail_s=tail,
+                basis=f"{len(samples)} prior successful runs still active at {elapsed:.0f}s; "
+                      f"median time left plus {paired_duration(extra)} for subsequent work and waits")
+
+
 def cmd_paired(args, now):
     if not args.reference or not args.reference.strip() or not args.model or not args.model.strip():
         sys.exit("--agent-min needs --reference (remaining work) and --model")
@@ -843,12 +881,26 @@ def cmd_paired(args, now):
                 kind=args.agent, cwd=os.getcwd(),
                 note=args.note or reference)
     pred.update(paired_forecast(pred, confirmed_pairs()))
+    pred["event"] = args.event
+    if args.command is not None or args.ci_job:
+        if args.tail_min is None:
+            sys.exit("specify --tail-min for work after the command (0 if its success completes the task)")
+        state = apply_job_history(pred, args)
+        if state:
+            message = f"CI job state: {state}. Reassess the remaining task before forecasting."
+            print(json.dumps({"state": state, "recorded": False, "message": message}) if args.json else message)
+            return
+    elif args.tail_min is not None or args.elapsed_s is not None:
+        sys.exit("--tail-min and --elapsed-s require a job history source")
     if not args.no_record:
         append_jsonl(pred_path(), pred)
     out = dict(id=pid, remaining=paired_duration(pred["est_s"]), finish=fmt_clock(now + pred["est_s"], now),
                low=paired_duration(pred["low_s"]), high=paired_duration(pred["high_s"]),
                recorded=not args.no_record, **{k: pred[k] for k in
                ("est_s", "agent_s", "low_s", "high_s", "method", "basis", "n_cal")})
+    if pred.get("job_samples") is not None:
+        out.update(job_samples=pred["job_samples"], job_elapsed_s=pred["job_elapsed_s"],
+                   tail_s=pred["tail_s"])
     if args.json:
         print(json.dumps(out, indent=2))
     else:
@@ -861,12 +913,12 @@ def cmd_paired(args, now):
 
 
 def cmd_estimate(args):
-    for value in (args.agent_min, args.wait_min, args.calls, args.minutes):
+    for value in (args.agent_min, args.wait_min, args.calls, args.minutes, args.elapsed_s, args.tail_min):
         if value is not None and (not math.isfinite(value) or value < 0):
             sys.exit("durations and call counts must be finite and nonnegative")
     if args.agent_min is not None:
         return cmd_paired(args, time.time())
-    if args.batch or args.reference or args.model or args.task_id:
+    if args.batch or args.reference or args.model or args.task_id or args.command or args.ci_job or args.tail_min is not None or args.elapsed_s is not None:
         sys.exit("paired forecast options require --agent-min")
     if args.calls is None and args.minutes is None:
         sys.exit("estimate needs --calls N (preferred) or --minutes M")
@@ -1010,6 +1062,10 @@ def cmd_stats(args):
         print(f"paired forecasts: {len(pairs)} explicitly closed; mean absolute error "
               f"skill {statistics.mean(skill):.1f}s, agent {statistics.mean(agent):.1f}s; "
               f"{wins} wins, {ties} ties, {len(pairs)-wins-ties} losses")
+        hits = sum(p["low_s"] <= r["actual_s"] <= p["high_s"] for p, r in pairs)
+        print(f"paired range coverage {hits}/{len(pairs)}; median absolute miss "
+              f"skill {statistics.median(skill)/60:.2f}m, agent {statistics.median(agent)/60:.2f}m; "
+              f"worst miss skill {max(skill)/60:.2f}m, agent {max(agent)/60:.2f}m")
     if cal["n"]:
         errs = [abs(r["actual_s"] - p["est_s"]) / max(r["actual_s"], 60) for p, r in cal["rows"]]
         print(f"inside predicted range: {cal['hits']}/{cal['n']} "
@@ -1058,7 +1114,13 @@ def main(argv=None):
     p.add_argument("--agent-min", type=float, help="working agent's independent total remaining minutes")
     p.add_argument("--reference", help="repeatable description of the remaining work and its scale")
     p.add_argument("--model", help="working agent model identity")
-    p.add_argument("--batch", type=float, nargs=3, metavar=("DONE", "TOTAL", "SECONDS"),
+    sources = p.add_mutually_exclusive_group()
+    sources.add_argument("--command", help="exact local shell command, measured from project transcripts")
+    sources.add_argument("--ci-job", help="GitHub Actions job URL")
+    p.add_argument("--elapsed-s", type=float, help="observed time since this command attempt started")
+    p.add_argument("--tail-min", type=float, help="estimated work after successful job completion")
+    p.add_argument("--event", default="check-in", choices=["check-in", "started", "retry", "overrun", "scope-change"])
+    sources.add_argument("--batch", type=float, nargs=3, metavar=("DONE", "TOTAL", "SECONDS"),
                    help="homogeneous batch accounting for all variable work: observed units done, total, elapsed seconds")
     p.add_argument("--task-id", help="stable identifier across forecasts for one task")
     p.add_argument("--calls", type=int, help="tool calls still needed")

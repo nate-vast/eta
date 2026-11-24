@@ -7,6 +7,7 @@ Ask `/eta` during a task to get a remaining duration, finish time, rough range a
 The working agent gives its own total remaining time in private before seeing the skill's forecast. The script records both estimates at one timestamp.
 
 - **Measured progress.** When the remaining work is a homogeneous batch, the script uses the actual time per completed unit and the number still to go.
+- **Previous command and CI runtimes.** An exact local shell command reads successful executions in up to 40 recent project transcripts from the selected harness. A GitHub Actions job URL retrieves successful jobs matching repository, workflow, branch, event and job name via the authenticated `gh` CLI. Completed attempt metadata is cached locally. At least three previous runs must have lasted longer than the current elapsed time. The forecast uses their median remaining duration and adds the explicitly estimated work after success. Failed or cancelled jobs need a new whole-task assessment.
 - **Comparable finishes.** For recurring work, the last 40 eligible completed tasks from the same project directory, harness, model and remaining-work label provide a comparison. With at least three distinct tasks, the script scores three options against earlier outcomes. These are the working agent’s estimate, a blend with the historical median, and a correction for the agent’s observed timing bias. Each earlier task is left out when predicting its own outcome. The option with the lowest total absolute error supplies the forecast. Known nonoverlapping waits are removed before fitting and added back at their current duration.
 - **Cold start.** With insufficient comparable history or progress data, the output identifies the agent's own estimate as the fallback. The range is descriptive. The trials cover short coding tasks and measurable batches. See [paired accuracy trials](verify/PAIRED.md).
 
@@ -31,6 +32,8 @@ python3 ~/.eta/eta.py stats
 ```
 
 Use `references --model MODEL --agent codex` to look up existing remaining-work labels for this scope. Use `--batch DONE TOTAL SECONDS` for measured progress covering all remaining variable work. `--wait-min` adds a known, nonoverlapping wait. `--json` exposes both predictions in seconds. Multiple forecasts for the same job share a task ID and can be closed together with `done --id ID1 ID2`.
+
+For a running command use `--command "make test" --elapsed-s 120 --tail-min 0`. For GitHub Actions use `--ci-job JOB_URL --tail-min MINUTES`. Supply the time needed after success, including verification or deployment. Change the event to `started`, `retry`, `overrun` or `scope-change` when the agent observes a transition and issues another forecast for the same task. No service runs in the background. Each forecast is scored from its own issue time. See [the longer-task benchmark](verify/COMMANDS.md).
 
 Existing `measure`, `estimate --calls`, `estimate --minutes` and session-based `done` commands still support the previous transcript workflow. Legacy estimates apply their correction to variable work and add known waits afterward. For the open-model invocation tests, see [verification results](verify/RESULTS.md).
 
