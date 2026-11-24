@@ -13,6 +13,7 @@
 #                      and does not already read ~/.agents/skills
 # The script itself is linked at ~/.eta/eta.py so every harness uses one stable path.
 set -euo pipefail
+umask 077
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$REPO/skills/eta"
@@ -40,22 +41,59 @@ ours() {  # is $1 something this installer put there?
   return 1
 }
 
+state="$HOME/.eta"
+if [ -L "$state" ]; then
+  echo "Refusing to modify a symlinked state directory: $state" >&2
+  exit 1
+fi
+
+copy_marker='# Managed copy from the eta skill installer.'
+runtime_ours() {
+  local path="$state/$1"
+  if [ -L "$path" ]; then
+    [ "$(readlink "$path")" = "$SRC/scripts/$1" ]
+  else
+    [ -f "$path" ] && [ "$(sed -n '2p;2q' "$path")" = "$copy_marker" ]
+  fi
+}
+
 if [ "$UNINSTALL" = 1 ]; then
   for t in "${targets[@]}"; do
     if ours "$t/eta"; then rm -rf "$t/eta"; echo "removed $t/eta"; fi
   done
-  if [ -L "$HOME/.eta/eta.py" ]; then rm "$HOME/.eta/eta.py"; echo "removed ~/.eta/eta.py (history kept in ~/.eta)"; fi
+  for name in eta.py job_history.py; do
+    if runtime_ours "$name"; then rm "$state/$name"; fi
+  done
   exit 0
 fi
 
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || { echo "needs python3 >= 3.9" >&2; exit 1; }
-chmod +x "$SRC/scripts/eta.py"
 
-mkdir -p "$HOME/.eta"
+# A neighboring job_history.py can shadow imports in copy mode.
+for name in eta.py job_history.py; do
+  path="$state/$name"
+  if { [ -e "$path" ] || [ -L "$path" ]; } && ! runtime_ours "$name"; then
+    echo "Preserved unrecognized file: $path. Move it aside before installing." >&2
+    exit 1
+  fi
+done
+mkdir -p "$state"
+python3 - "$SRC/scripts/eta.py" "$state" <<'PYTHON'
+import runpy
+import sys
+runpy.run_path(sys.argv[1])["secure_history"](sys.argv[2], private_dir=True)
+PYTHON
+
 if [ "$MODE" = link ]; then
-  ln -sfn "$SRC/scripts/eta.py" "$HOME/.eta/eta.py"
+  ln -sfn "$SRC/scripts/eta.py" "$state/eta.py"
+  if runtime_ours job_history.py; then rm "$state/job_history.py"; fi
 else
-  rm -f "$HOME/.eta/eta.py"; cp "$SRC/scripts/eta.py" "$SRC/scripts/job_history.py" "$HOME/.eta/"
+  for name in job_history.py eta.py; do
+    temp=$(mktemp "$state/.eta-install.XXXXXXXX")
+    awk -v marker="$copy_marker" 'NR == 1 { print; print marker; next } { print }' "$SRC/scripts/$name" > "$temp"
+    [ "$name" != eta.py ] || chmod 700 "$temp"
+    mv -f "$temp" "$state/$name"
+  done
 fi
 echo "script  ~/.eta/eta.py"
 

@@ -22,6 +22,8 @@ git clone https://github.com/nate-vast/eta ~/projects/eta
 
 The installer links the shared skill and `~/.eta/eta.py`. It also supports `--copy`, `--dir PATH` and `--uninstall`. Python 3.9+ is required. Run from a consistent project directory. Set `ETA_HOME` to use an isolated history.
 
+On POSIX, ETA restricts its default history directory to its owner and stores history files with mode 0600. A custom `ETA_HOME` keeps its existing directory permissions. The installer preserves unrecognized launcher and helper files. If upgrading an older unmarked `--copy` installation, move those files aside and run the installer again.
+
 ## CLI
 
 ```bash

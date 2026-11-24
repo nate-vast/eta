@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import stat
 import statistics
 import sys
 import time
@@ -39,6 +40,33 @@ SYSTEM_PREFIXES = ("<task-notification>", "This session is being continued",
 
 def home() -> str:
     return os.path.expanduser(os.environ.get("ETA_HOME", "~/.eta"))
+
+
+def secure_history(directory, private_dir):
+    """Restrict existing state without following links or chmodding a custom parent."""
+    if os.name != "posix" or not os.path.lexists(directory):
+        return
+    if private_dir:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fchmod(fd, 0o700)
+        finally:
+            os.close(fd)
+    for name in ("predictions.jsonl", "resolutions.jsonl", "done.lock", "ci-history.sqlite",
+                 "ci-history.sqlite-journal", "ci-history.sqlite-shm", "ci-history.sqlite-wal"):
+        path = os.path.join(directory, name)
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            continue
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                sys.exit(f"Unexpected ETA history entry: {path}")
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
 
 
 def pred_path() -> str:
@@ -1167,4 +1195,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # Applies to new ledgers, locks and SQLite sidecars, including under ETA_HOME.
+    os.umask(0o077)
+    secure_history(home(), private_dir=os.path.abspath(home()) == os.path.expanduser("~/.eta"))
     main()

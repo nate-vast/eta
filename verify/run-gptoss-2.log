@@ -24,7 +24,7 @@ Ran 0 tests in 0.000s
 
 OK
 === eta log
-{"id": "357b60874a23", "created": 1795474465.143184, "transcript": "/Users/nate/projects/eta/.verify/pi-agent/sessions/--Users-nate-projects-eta-.verify-work-gptoss--/2026-11-23T22-54-12-827Z_01a20a9d-f15a-75db-b3dc-35f99321457b.jsonl", "kind": "pi", "session": "2026-11-23T22-54-12-827Z_01a20a9d-f15a-75db-b3dc-35f99321457b", "cwd": "/Users/nate/projects/eta/.verify/work-gptoss", "task": "Start the task in TASK.md. Do items 1 and 2 (word_count and top_words) in textstats.py first, then stop there: I will check in with you, and after that you c...", "task_start": 1795474452.837, "calls": 4, "minutes": null, "wait_s": 0, "spc": 25.0, "spc_core": 25.0, "pace_source": "default", "raw_s": 100.0, "factor": 1.0, "n_cal": 0, "est_s": 100.0, "low_s": 60.0, "high_s": 180.0, "note": "implement remaining functions, tests, README"}
+{"id": "357b60874a23", "created": 1795474465.143184, "transcript": "/workspace/eta/.verify/pi-agent/sessions/--workspace-eta-.verify-work-gptoss--/2026-11-23T22-54-12-827Z_01a20a9d-f15a-75db-b3dc-35f99321457b.jsonl", "kind": "pi", "session": "2026-11-23T22-54-12-827Z_01a20a9d-f15a-75db-b3dc-35f99321457b", "cwd": "/workspace/eta/.verify/work-gptoss", "task": "Start the task in TASK.md. Do items 1 and 2 (word_count and top_words) in textstats.py first, then stop there: I will check in with you, and after that you c...", "task_start": 1795474452.837, "calls": 4, "minutes": null, "wait_s": 0, "spc": 25.0, "spc_core": 25.0, "pace_source": "default", "raw_s": 100.0, "factor": 1.0, "n_cal": 0, "est_s": 100.0, "low_s": 60.0, "high_s": 180.0, "note": "implement remaining functions, tests, README"}
 === stats
 ETA TRACK RECORD  (1 logged, 0 checked against real finish times)
 waiting to be checked: 1
