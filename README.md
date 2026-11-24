@@ -1,40 +1,16 @@
 # eta
 
-Type `/eta` and your coding agent tells you when the current task will be done, with a clock time, a range, and the basis for it. It works with any agent in any harness.
+Ask `/eta` during a task to get a remaining duration, finish time, rough range and the evidence behind them. The agent posts the result and continues working. Claude Code uses `/eta`, Codex supports `$eta` and pi uses `/skill:eta`.
 
-```
-ETA: ~14 min (done around 3:42 PM, likely 9 to 24 min)
-Done so far: parser rewritten, 12 of 20 tests passing.
-Left: fix 8 tests, update docs, commit (about 38 tool calls + a 2 min build).
-Basis: 19 s per tool call measured on this task; past ETAs ran x1.4 long, corrected. Confidence: medium.
-```
+## How the forecast works
 
-Then the agent keeps working. `/eta` is a check-in, not a stop.
+The working agent gives its own total remaining time in private before seeing the skill's forecast. The script records both estimates at one timestamp.
 
-## Why it's accurate
+- **Measured progress.** When the remaining work is a homogeneous batch, the script uses the actual time per completed unit and the number still to go.
+- **Comparable finishes.** For recurring work, the last 40 eligible completed tasks from the same project directory, harness, model and remaining-work label provide a comparison. With at least three distinct tasks, the script scores three options against earlier outcomes. These are the working agent’s estimate, a blend with the historical median, and a correction for the agent’s observed timing bias. Each earlier task is left out when predicting its own outcome. The option with the lowest total absolute error supplies the forecast. Known nonoverlapping waits are removed before fitting and added back at their current duration.
+- **Cold start.** With insufficient comparable history or progress data, the output identifies the agent's own estimate as the fallback. The range is descriptive. The trials cover short coding tasks and measurable batches. See [paired accuracy trials](verify/PAIRED.md).
 
-Agents are bad at guessing wall-clock time. They think in human-developer hours and have no clock sense. So `/eta` never asks the model to guess minutes:
-
-1. **Measure.** `eta.py measure` reads the session's own transcript: when this task's prompt came in, active working time (time spent waiting on you is excluded), tool calls made, seconds per call, long operations (builds, downloads), todo-list progress and step pace.
-2. **Count.** The agent lists the remaining steps and counts the tool calls each needs, plus known long waits. Counting steps is something models are good at.
-3. **Convert.** `eta.py estimate` turns calls into time with the measured pace, then applies a calibration factor.
-4. **Calibrate.** Every ETA is logged in `~/.eta/`. Later runs check each old prediction against the transcript to see when the work really stopped (or the agent runs `eta.py done`). The median actual/predicted ratio of the last 40 becomes the correction, and the spread of those ratios sets the range. If your agent always runs 40% long, ETAs get 40% longer, automatically.
-
-`/eta stats` shows the track record: how often the real finish landed inside the range, and the median error.
-
-## Any agent, any harness
-
-| Harness | How `/eta` is invoked | Pace data |
-|---|---|---|
-| Claude Code (CLI, desktop, T3 Code, Agent SDK) | `/eta` | transcript, automatic (exact session via `${CLAUDE_SESSION_ID}`) |
-| Codex | `$eta` or `/skills` | transcript, automatic (`~/.codex/sessions`) |
-| pi | `/skill:eta` | transcript, automatic (`~/.pi/agent/sessions`) |
-| OpenCode, Gemini CLI, Cursor, Amp, others with Agent Skills | the tool's skill invocation | self-reported: the agent passes `--started` and `--calls-done` from its own context, and runs `eta.py done` at the end |
-| Anything else | paste the body of `skills/eta/SKILL.md` as a prompt | self-reported |
-
-**Open models** (tested 2026-11-23 in pi with local gpt-oss-20b and Qwen3-Coder-30B-A3B, see [verify/RESULTS.md](verify/RESULTS.md)): gpt-oss follows the full procedure mid-task and keeps working, though it tends to post the ETA text at the end of its turn. Qwen3-Coder-30B often ignores an `/eta` that arrives mid-turn. Re-run with `verify/rpc_eta.py <provider> <model> <label>`.
-
-Adding a transcript reader for another harness is one function in `eta.py` that emits the shared event shapes (prompt, tool, tool_done, todos); see `read_pi` for a 30-line example.
+At completion, the agent closes the specific forecast IDs after verifying the requested outcome. Giving up, starting another turn, and transcript inactivity leave paired forecasts open. `/eta stats` reports mean absolute error for both methods, wins, ties, losses, and open forecasts. The legacy call-count method has a separate track record.
 
 ## Install
 
@@ -43,32 +19,19 @@ git clone https://github.com/nate-vast/eta ~/projects/eta
 ~/projects/eta/install.sh
 ```
 
-That links the skill into `~/.claude/skills/eta` and `~/.agents/skills/eta` (read by Codex, pi, OpenCode and others) and the script to `~/.eta/eta.py`. Options: `--copy` to copy instead of link, `--dir PATH` to add another skills folder, `--uninstall` to remove (your `~/.eta` history stays). Needs Python 3.9+, no dependencies. Start a new agent session after installing.
+The installer links the shared skill and `~/.eta/eta.py`. It also supports `--copy`, `--dir PATH` and `--uninstall`. Python 3.9+ is required. Run from a consistent project directory. Set `ETA_HOME` to use an isolated history.
 
 ## CLI
 
 ```bash
-python3 ~/.eta/eta.py measure  [--session ID] [--from N] [--started 14:05 --calls-done 40]
-python3 ~/.eta/eta.py estimate --calls 38 [--wait-min 2] [--note "tests, docs, commit"]
-python3 ~/.eta/eta.py done
+python3 ~/.eta/eta.py estimate --agent-min MINUTES --model MODEL --agent codex \
+    --reference "remaining stage and scale" --task-id UNIQUE_JOB
+python3 ~/.eta/eta.py done --id PREDICTION_ID
 python3 ~/.eta/eta.py stats
 ```
 
-`--from N` picks an earlier prompt as the task start when you gave follow-ups. `--json` on measure/estimate for machine output. `ETA_HOME` moves the data folder.
+Use `references --model MODEL --agent codex` to look up existing remaining-work labels for this scope. Use `--batch DONE TOTAL SECONDS` for measured progress covering all remaining variable work. `--wait-min` adds a known, nonoverlapping wait. `--json` exposes both predictions in seconds. Multiple forecasts for the same job share a task ID and can be closed together with `done --id ID1 ID2`.
 
-## How a finish time is detected
+Existing `measure`, `estimate --calls`, `estimate --minutes` and session-based `done` commands still support the previous transcript workflow. Legacy estimates apply their correction to variable work and add known waits afterward. For the open-model invocation tests, see [verification results](verify/RESULTS.md).
 
-For a prediction made at time T, the task counts as finished at the agent's last action before your next real prompt (other `/eta` prompts and background-task notifications don't count). If there is no next prompt yet, it waits until the transcript has been quiet for 20 minutes. If the agent stopped within 30 seconds of answering, that prediction is marked inconclusive and left out. `eta.py done` overrides all of this with the exact time.
-
-## Tests
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-## Files
-
-- `skills/eta/SKILL.md`: the skill (Agent Skills format)
-- `skills/eta/scripts/eta.py`: measure, estimate, done, stats (stdlib only)
-- `install.sh`: installer for every harness on the machine
-- `tests/test_eta.py`: transcript readers, pace math, calibration, self-reported mode
+Run the test suite with `python3 -m unittest discover -s tests -v`.
