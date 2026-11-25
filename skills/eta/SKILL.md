@@ -5,7 +5,7 @@ description: Estimate how long the working agent needs to finish its current tas
 
 # /eta
 
-For `stats`, run `python3 ~/.eta/eta.py stats`. For a task that is finished, say so. If blocked on a user decision, identify it.
+For `stats long`, run `python3 ~/.eta/eta.py stats --min-remaining-min 5` (use the requested threshold if supplied). For `stats`, run `python3 ~/.eta/eta.py stats`. For a task that is finished, say so. If blocked on a user decision, identify it.
 
 For a running task, privately choose your own best estimate of **total remaining wall-clock minutes to verified completion** before looking up times or past results. Include waits, retries and verification. Fractional minutes work. Keep that estimate private as a scoring baseline. Use measured mode for every user-facing ETA:
 

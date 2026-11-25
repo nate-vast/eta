@@ -10,6 +10,8 @@ With too little evidence, the skill reports **“No measured ETA yet.”** Closi
 
 At completion, the agent closes the specific forecast IDs after verifying the requested outcome. Giving up, starting another turn, and transcript inactivity leave paired forecasts open. `/eta stats` reports mean absolute error for both methods, wins, ties, losses, and open forecasts. The legacy call-count method has a separate track record.
 
+Use `/eta stats long` to check whether the skill beats your agent when at least five minutes actually remained. It scores the first measured check-in per verified task, reports how often each estimate was too long, and counts tasks where the skill lacked evidence. Accuracy on long, open-ended work remains unproven.
+
 ## Install
 
 ```bash

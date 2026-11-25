@@ -1113,7 +1113,35 @@ def cmd_done(args):
         print("nothing to close (no open ETA for this session in the last 12 h).")
 
 
+def long_task_stats(minutes):
+    if not math.isfinite(minutes) or minutes <= 0:
+        sys.exit("--min-remaining-min needs a positive finite duration")
+    # One observation per task prevents heavily monitored tasks dominating the score.
+    first = {}
+    for pred, result in sorted(confirmed_pairs(), key=lambda pair: pair[0]["created"]):
+        if pred.get("measured"):
+            first.setdefault((tuple(pred["cohort"][:-1]), pred["run"]), (pred, result))
+    eligible = [(p, r["actual_s"]) for p, r in first.values() if r["actual_s"] >= minutes * 60]
+    issued = [(p, actual) for p, actual in eligible if p["est_s"] is not None]
+    print(f"At least {minutes:g} minutes actually remained at first measured check-in: "
+          f"{len(issued)}/{len(eligible)} verified tasks received an ETA.")
+    if not issued:
+        print("No paired long-task forecasts to score yet.")
+        return
+    for label, key in (("Skill", "est_s"), ("Agent", "agent_s")):
+        misses = [p[key] - actual for p, actual in issued]
+        overs = [e for e in misses if e > 0]
+        print(f"{label}: mean absolute miss {paired_duration(statistics.mean(map(abs, misses)))}; "
+              f"too long on {len(overs)}/{len(issued)} tasks"
+              + (f" by {paired_duration(statistics.mean(overs))} on average." if overs else "."))
+    wins = sum(abs(p["est_s"] - actual) < abs(p["agent_s"] - actual) for p, actual in issued)
+    ties = sum(abs(p["est_s"] - actual) == abs(p["agent_s"] - actual) for p, actual in issued)
+    print(f"Skill vs agent: {wins} closer, {ties} tied, {len(issued)-wins-ties} further.")
+
+
 def cmd_stats(args):
+    if args.min_remaining_min is not None:
+        return long_task_stats(args.min_remaining_min)
     resolve_pending()
     cal = calibration()
     preds = load_jsonl(pred_path())
@@ -1218,6 +1246,7 @@ def main(argv=None):
     p.add_argument("--model", required=True)
     p.set_defaults(fn=cmd_references)
     p = sub.add_parser("stats", help="past ETAs vs actual finish times")
+    p.add_argument("--min-remaining-min", type=float, help="compare first measured check-ins by verified remaining time")
     p.add_argument("--limit", type=int, default=15)
     p.set_defaults(fn=cmd_stats)
 

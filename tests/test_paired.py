@@ -30,6 +30,21 @@ class Paired(Base):
             self.assertEqual((p["est_s"], p["method"]), (30, "verified task history"))
         self.assertIn("measured ETA coverage: 0/3", run(["stats"]))
 
+    def test_long_stats_use_actual_time_and_one_check_in_per_task(self):
+        with patch.object(eta.time, "time", return_value=self.now - 2000):
+            a = self.forecast("one", 20, "--measured", "--batch", "1", "3", "180")
+            b = self.forecast("two", 20, "--measured")
+            short = self.forecast("short", 20, "--measured")
+        self.close_after(a, 360)
+        self.close_after(b, 400)
+        self.close_after(short, 299)
+        repeat = self.forecast("one", 30, "--measured")
+        self.close_after(repeat, 500)
+        report = run(["stats", "--min-remaining-min", "5"])
+        self.assertIn("1/2 verified tasks", report)
+        self.assertIn("Agent: mean absolute miss 14m 00s; too long on 1/1", report)
+        self.assertIn("1 closer, 0 tied, 0 further", report)
+
     def test_live_progress_and_fixed_wait(self):
         p = self.forecast("job", 5, "--batch", "20", "100", "30", "--wait-min", "2")
         self.assertEqual((p["est_s"], p["agent_s"]), (240, 300))
