@@ -54,3 +54,9 @@ python3 verify/score_steps.py ci-peers.json
 python3 verify/score_ci_band.py ci-band.json
 python3 verify/score_ci_band.py
 ```
+
+## Whole workflows discovered from the checkout
+
+The public skill can discover the running workflow from the GitHub origin and exact checked-out commit. It compares successful first attempts of the same workflow, branch and event that finished before this run started. Timings cover the entire workflow, including later jobs. The elapsed clock starts at workflow creation. GitHub's final update timestamp on successful runs supplies the historical finish.
+
+On 100 consecutive successful pytest main-branch push runs, we reserved the latest 20 for replay. At five minutes from workflow creation, all 20 received estimates. Median actual remaining time was 8m 57s, mean absolute miss was 2m 08s, and 15 forecasts were too long. This measures successful workflow waits. The trial had no contemporaneous working-agent guesses. Run `python3 verify/score_workflow.py` to reproduce the aggregate from the frozen timestamps. The installed CLI also discovered PyTorch's live Lint workflow from a checkout and issued a forecast using 100 prior successful runs.

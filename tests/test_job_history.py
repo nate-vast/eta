@@ -32,6 +32,16 @@ class History(Base):
         from test_eta import eta
         self.assertEqual(eta.load_jsonl(eta.pred_path())[-1]["event"], "retry")
 
+    def test_remaining_commands_include_tail_and_require_evidence_for_every_step(self):
+        argv = ["estimate", "--measured", "--model", "m", "--reference", "verify", "--task-id", "k",
+                "--agent", "codex", "--agent-min", "99", "--json", "--no-record",
+                "--remaining-command", "build", "--remaining-command", "test", "--elapsed-s", "60"]
+        history = {"build": [100, 110, 120], "test": [300, 310, 320], "package": []}
+        with patch.object(jobs, "recent_project_files", return_value=[]), patch.object(
+                jobs, "local_durations", side_effect=lambda files, cwd, cmd, before: history[cmd]):
+            self.assertEqual(json.loads(run(argv))["est_s"], 360)
+            self.assertIsNone(json.loads(run(argv + ["--remaining-command", "package"]))["est_s"])
+
     def test_reject_codex_start_and_foreign_pi_session(self):
         p = Path(self.tmp.name)/"case.jsonl"
         item = dict(type="CommandExecution", status="completed", exit_code=0, cwd="/p",

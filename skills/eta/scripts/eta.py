@@ -862,6 +862,34 @@ def paired_forecast(pred, pairs):
                 f"earlier comparable tasks; fixed wait {fmt_dur(wait)}")
 
 
+def apply_command_plan(pred, args):
+    """Time a known sequence of remaining commands without running any of them."""
+    import job_history
+    if not args.measured or not args.agent or args.tail_min is not None:
+        sys.exit("--remaining-command needs --measured and --agent; include every remaining command")
+    elapsed = args.elapsed_s or 0
+    cwd = os.path.realpath(os.getcwd())
+    files = job_history.recent_project_files(args.agent, cwd)
+    history = {}
+    point = low = high = pred["wait_s"]
+    counts = []
+    for index, command in enumerate(args.remaining_command):
+        if command not in history:
+            history[command] = job_history.local_durations(((p, args.agent) for p in files),
+                                                          cwd, command, pred["created"])
+        samples = job_history.remaining(history[command], elapsed if index == 0 else 0)
+        if len(samples) < MIN_CAL:
+            pred["basis"] += f"; remaining command {index + 1} has only {len(samples)} matching runs"
+            return
+        counts.append(len(samples))
+        point += statistics.median(samples)
+        low += quantile(samples, .1)
+        high += quantile(samples, .9)
+    pred.update(est_s=point, low_s=low, high_s=high, method="remaining command history",
+                basis=f"{len(counts)} sequential commands, each timed from {min(counts)} or more "
+                      f"previous successes; includes {paired_duration(pred['wait_s'])} in separate waits")
+
+
 def apply_job_history(pred, args):
     import job_history
     import sqlite3
@@ -881,9 +909,15 @@ def apply_job_history(pred, args):
         if args.elapsed_s is not None:
             sys.exit("--ci-job reads the attempt start time from GitHub; omit --elapsed-s")
         try:
-            history = job_history.ci_history(args.ci_job, home(), pred["created"])
+            if args.checkout_ci is not None:
+                history = job_history.checkout_workflow_history(args.checkout_ci, pred["created"])
+            else:
+                history = job_history.ci_history(args.ci_job, home(), pred["created"])
             samples, elapsed, state = history.remaining, history.elapsed, history.state
             step, method = history.step, history.method
+        except job_history.WorkflowSelectionError as error:
+            pred["basis"] += f"; {error}"
+            return
         except (OSError, KeyError, TypeError, ValueError, sqlite3.Error) as error:
             pred["basis"] += f"; CI history unavailable ({type(error).__name__})"
             return
@@ -942,7 +976,9 @@ def cmd_paired(args, now):
                 note=args.note or reference)
     pred.update(paired_forecast(pred, confirmed_pairs()))
     pred["event"] = args.event
-    if args.command is not None or args.ci_job:
+    if args.remaining_command:
+        apply_command_plan(pred, args)
+    elif args.command is not None or args.ci_job or args.checkout_ci is not None:
         if args.tail_min is None:
             sys.exit("specify --tail-min for work after the command (0 if its success completes the task)")
         state = apply_job_history(pred, args)
@@ -988,7 +1024,7 @@ def cmd_estimate(args):
             sys.exit("durations and call counts must be finite and nonnegative")
     if args.agent_min is not None:
         return cmd_paired(args, time.time())
-    if args.measured or args.batch or args.reference or args.model or args.task_id or args.command or args.ci_job or args.tail_min is not None or args.elapsed_s is not None:
+    if args.remaining_command or args.measured or args.batch or args.reference or args.model or args.task_id or args.command or args.ci_job or args.checkout_ci is not None or args.tail_min is not None or args.elapsed_s is not None:
         sys.exit("paired forecast options require --agent-min")
     if args.calls is None and args.minutes is None:
         sys.exit("estimate needs --calls N (preferred) or --minutes M")
@@ -1221,7 +1257,11 @@ def main(argv=None):
     p.add_argument("--reference", help="repeatable description of the remaining work and its scale")
     p.add_argument("--model", help="working agent model identity")
     sources = p.add_mutually_exclusive_group()
+    sources.add_argument("--remaining-command", action="append", metavar="COMMAND",
+                         help="repeat for each sequential command through verified completion")
     sources.add_argument("--command", help="exact local shell command, measured from project transcripts")
+    sources.add_argument("--checkout-ci", nargs="?", const="", metavar="WORKFLOW",
+                         help="discover a running GitHub workflow for the checked-out commit")
     sources.add_argument("--ci-job", help="GitHub Actions job URL")
     p.add_argument("--elapsed-s", type=float, help="observed time since this command attempt started")
     p.add_argument("--tail-min", type=float, help="estimated work after successful job completion")

@@ -203,6 +203,53 @@ def attempt_jobs(endpoint):
         page += 1
 
 
+class WorkflowSelectionError(ValueError):
+    """A user-visible reason the current checkout could not identify a workflow."""
+
+
+def checkout_workflow_history(workflow, now):
+    """Find the checkout's workflow and time complete runs, including downstream jobs."""
+    def git(*args):
+        result = subprocess.run(["git", *args], capture_output=True, text=True)
+        if result.returncode:
+            raise WorkflowSelectionError("checkout unavailable")
+        return result.stdout.strip()
+
+    remote = git("remote", "get-url", "origin").removesuffix(".git")
+    match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([\w.-]+/[\w.-]+)", remote)
+    if not match or any(part in (".", "..") for part in match.group(1).split("/")):
+        raise WorkflowSelectionError("GitHub origin required")
+    sha = git("rev-parse", "HEAD")
+    api = f"repos/{match.group(1)}/actions"
+    result = gh(f"{api}/runs?" + urlencode(dict(head_sha=sha, per_page=100)))
+    if result["total_count"] > len(result["workflow_runs"]):
+        raise WorkflowSelectionError("too many workflows to identify a unique run")
+    candidates = [r for r in result["workflow_runs"] if r["head_sha"] == sha
+                  and (not workflow or r["name"] == workflow)]
+    if not candidates:
+        raise WorkflowSelectionError("no matching workflow on this commit")
+    if len(candidates) > 1:
+        raise WorkflowSelectionError("multiple runs match; select the exact workflow name or a job URL")
+    run = candidates[0]
+    if run["status"] == "completed":
+        return CIHistory([], 0, run.get("conclusion") or "completed")
+    if run["run_attempt"] != 1:
+        raise WorkflowSelectionError("rerun timing unavailable; select the current job URL")
+    if run["status"] != "in_progress":
+        return CIHistory([], 0, run["status"])
+    start = epoch(run["created_at"])
+    elapsed = max(0, now - start)
+    params = urlencode(dict(branch=run["head_branch"], event=run["event"], status="success", per_page=100))
+    rows = gh(f"{api}/workflows/{run['workflow_id']}/runs?{params}")["workflow_runs"]
+    durations = [epoch(r["updated_at"]) - epoch(r["created_at"]) for r in rows
+                 if r["id"] != run["id"] and r["run_attempt"] == 1
+                 and epoch(r["updated_at"]) < start and r["conclusion"] == "success"]
+    latest = gh(f"{api}/runs/{run['id']}")
+    if latest["status"] != "in_progress" or latest["run_attempt"] != 1:
+        return CIHistory([], 0, latest.get("conclusion") or latest["status"])
+    return CIHistory(remaining(durations, elapsed), elapsed, "running", method="workflow history")
+
+
 def ci_history(url, cache_dir, now):
     match = re.fullmatch(r"https://github\.com/([\w.-]+/[\w.-]+)/actions/runs/(\d+)/job/(\d+)/?", url)
     if not match:
