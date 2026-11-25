@@ -140,6 +140,38 @@ def recent_project_files(kind, cwd):
     return [path for _, path in sorted(files, reverse=True)[:40]]
 
 
+def completed_codex_turns(path, cwd):
+    """Read matching turn-context and explicit completion records, ignoring interrupted turns."""
+    contexts = {}
+    with path.open(errors="replace") as stream:
+        for line in stream:
+            if '"turn_context"' not in line and '"task_complete"' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            payload = entry.get("payload") or {}
+            turn = payload.get("turn_id")
+            if not turn:
+                continue
+            if entry.get("type") == "turn_context":
+                contexts[turn] = (directory(payload.get("cwd")), payload.get("model"))
+            elif entry.get("type") == "event_msg" and payload.get("type") == "task_complete":
+                project, model = contexts.pop(turn, (None, None))
+                start, end = payload.get("started_at"), payload.get("completed_at")
+                if (project == cwd and model and isinstance(start, (int, float))
+                        and isinstance(end, (int, float)) and 0 < start < end):
+                    yield turn, model.casefold(), start, end
+
+
+def turn_remaining(records, model, age, now):
+    past = {turn: (end, end - start) for turn, name, start, end in records
+            if name == model.casefold() and end <= now - age and end - start > age}
+    recent = sorted(past.values())[-40:]
+    return [duration - age for _, duration in recent]
+
+
 def gh(endpoint):
     proc = subprocess.run(["gh", "api", endpoint], capture_output=True, text=True)
     if proc.returncode:

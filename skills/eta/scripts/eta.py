@@ -942,6 +942,26 @@ def cmd_paired(args, now):
                 note=args.note or reference)
     pred.update(paired_forecast(pred, confirmed_pairs()))
     pred["event"] = args.event
+    if args.turn_age_s is not None:
+        if not args.measured or args.agent != "codex" or args.batch or pred["wait_s"]:
+            sys.exit("--turn-age-s requires measured Codex timing without a batch or extra wait")
+        if pred["est_s"] is None:
+            import job_history
+            cwd = os.path.realpath(os.getcwd())
+            records = []
+            for path in job_history.recent_project_files("codex", cwd):
+                try:
+                    records.extend(job_history.completed_codex_turns(path, cwd))
+                except OSError:
+                    continue
+            samples = job_history.turn_remaining(records, args.model.strip(), args.turn_age_s, now)
+            if len(samples) >= 5:
+                pred.update(est_s=statistics.median(samples), low_s=quantile(samples, .1),
+                            high_s=quantile(samples, .9), method="observed turn duration",
+                            n_cal=len(samples), basis=f"{len(samples)} past turns from this project and model "
+                            f"ran beyond {args.turn_age_s:g}s; median time from there to final response")
+            else:
+                pred["basis"] += f"; {len(samples)} qualifying past turns (need 5)"
     if args.command is not None or args.ci_job:
         if args.tail_min is None:
             sys.exit("specify --tail-min for work after the command (0 if its success completes the task)")
@@ -983,12 +1003,12 @@ def cmd_paired(args, now):
 
 
 def cmd_estimate(args):
-    for value in (args.agent_min, args.wait_min, args.calls, args.minutes, args.elapsed_s, args.tail_min):
+    for value in (args.agent_min, args.wait_min, args.calls, args.minutes, args.elapsed_s, args.tail_min, args.turn_age_s):
         if value is not None and (not math.isfinite(value) or value < 0):
             sys.exit("durations and call counts must be finite and nonnegative")
     if args.agent_min is not None:
         return cmd_paired(args, time.time())
-    if args.measured or args.batch or args.reference or args.model or args.task_id or args.command or args.ci_job or args.tail_min is not None or args.elapsed_s is not None:
+    if args.measured or args.turn_age_s is not None or args.batch or args.reference or args.model or args.task_id or args.command or args.ci_job or args.tail_min is not None or args.elapsed_s is not None:
         sys.exit("paired forecast options require --agent-min")
     if args.calls is None and args.minutes is None:
         sys.exit("estimate needs --calls N (preferred) or --minutes M")
@@ -1194,6 +1214,7 @@ def main(argv=None):
     p.add_argument("--model", help="working agent model identity")
     sources = p.add_mutually_exclusive_group()
     sources.add_argument("--command", help="exact local shell command, measured from project transcripts")
+    sources.add_argument("--turn-age-s", type=float, help="observed age of the current Codex turn in seconds")
     sources.add_argument("--ci-job", help="GitHub Actions job URL")
     p.add_argument("--elapsed-s", type=float, help="observed time since this command attempt started")
     p.add_argument("--tail-min", type=float, help="estimated work after successful job completion")
