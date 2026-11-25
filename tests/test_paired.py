@@ -18,6 +18,18 @@ class Paired(Base):
         with patch.object(eta.time, "time", return_value=row["created"] + elapsed):
             run(["done", "--id", p["id"]])
 
+    def test_measured_mode_learns_from_abstentions_and_ignores_baseline(self):
+        start = self.now - 1000
+        for i, actual in enumerate((20, 30, 50)):
+            with patch.object(eta.time, "time", return_value=start + i * 100):
+                p = self.forecast(str(i), 10, "--measured")
+            self.assertIsNone(p["est_s"])
+            self.close_after(p, actual)
+        for guess in (.01, 50):
+            p = self.forecast("new", guess, "--measured", "--no-record")
+            self.assertEqual((p["est_s"], p["method"]), (30, "verified task history"))
+        self.assertIn("measured ETA coverage: 0/3", run(["stats"]))
+
     def test_live_progress_and_fixed_wait(self):
         p = self.forecast("job", 5, "--batch", "20", "100", "30", "--wait-min", "2")
         self.assertEqual((p["est_s"], p["agent_s"]), (240, 300))

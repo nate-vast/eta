@@ -827,6 +827,15 @@ def paired_forecast(pred, pairs):
                     high_s=wait + remaining * DEFAULT_SPREAD[1], n_cal=len(recent),
                     method="measured progress", basis=f"{total - completed:g} units left at "
                     f"{sample_s / completed:.2f}s per observed unit + {fmt_dur(wait)} of fixed waits")
+    if pred.get("measured"):
+        if len(recent) < MIN_CAL:
+            return dict(est_s=None, low_s=None, high_s=None, n_cal=len(recent),
+                        method="insufficient evidence", basis=f"{len(recent)} comparable verified finishes; need {MIN_CAL}")
+        observed = [r["actual_s"] - p["wait_s"] for p, r in recent]
+        return dict(est_s=wait + statistics.median(observed),
+                    low_s=wait + quantile(observed, .1), high_s=wait + quantile(observed, .9),
+                    n_cal=len(recent), method="verified task history",
+                    basis=f"median remaining duration of {len(recent)} comparable verified tasks plus fixed waits")
     if len(recent) < MIN_CAL:
         point = max(wait, pred["agent_s"])
         return dict(est_s=point, low_s=wait + (point - wait) * DEFAULT_SPREAD[0],
@@ -891,7 +900,11 @@ def apply_job_history(pred, args):
     extra = tail + pred["wait_s"]
     point = statistics.median(samples)
     estimate_basis = "median time left"
-    if step is not None:
+    if step is not None and pred.get("measured"):
+        if not history.late and history.elapsed_median is not None:
+            point = history.elapsed_median
+            estimate_basis = "whole-job median at the current elapsed time"
+    elif step is not None:
         guess = max(0, pred["agent_s"] - extra)
         lower, upper = quantile(samples, .25), quantile(samples, .75)
         if lower <= guess <= upper:
@@ -922,7 +935,7 @@ def cmd_paired(args, now):
     if batch and (not all(math.isfinite(x) and x > 0 for x in batch) or batch[0] > batch[1]):
         sys.exit("--batch needs positive completed units, total units and elapsed seconds (completed <= total)")
     reference = " ".join(args.reference.casefold().split())
-    pred = dict(id=pid, created=now, batch=batch, agent_s=args.agent_min * 60,
+    pred = dict(id=pid, created=now, measured=args.measured, batch=batch, agent_s=args.agent_min * 60,
                 wait_s=(args.wait_min or 0) * 60,
                 cohort=reference_scope(args) + [reference], run=args.task_id,
                 kind=args.agent, cwd=os.getcwd(),
@@ -941,6 +954,16 @@ def cmd_paired(args, now):
         sys.exit("--tail-min and --elapsed-s require a job history source")
     if not args.no_record:
         append_jsonl(pred_path(), pred)
+    if pred["est_s"] is None:
+        message = "No measured ETA yet. " + pred["basis"]
+        if args.json:
+            print(json.dumps(dict(id=pid, recorded=not args.no_record, state="insufficient_evidence",
+                                  est_s=None, finish=None, method=pred["method"], basis=pred["basis"])))
+        else:
+            print(message)
+            if not args.no_record:
+                print(f"after verified completion: python3 ~/.eta/eta.py done --id {pid}")
+        return
     out = dict(id=pid, remaining=paired_duration(pred["est_s"]), finish=fmt_clock(now + pred["est_s"], now),
                low=paired_duration(pred["low_s"]), high=paired_duration(pred["high_s"]),
                recorded=not args.no_record, **{k: pred[k] for k in
@@ -965,7 +988,7 @@ def cmd_estimate(args):
             sys.exit("durations and call counts must be finite and nonnegative")
     if args.agent_min is not None:
         return cmd_paired(args, time.time())
-    if args.batch or args.reference or args.model or args.task_id or args.command or args.ci_job or args.tail_min is not None or args.elapsed_s is not None:
+    if args.measured or args.batch or args.reference or args.model or args.task_id or args.command or args.ci_job or args.tail_min is not None or args.elapsed_s is not None:
         sys.exit("paired forecast options require --agent-min")
     if args.calls is None and args.minutes is None:
         sys.exit("estimate needs --calls N (preferred) or --minutes M")
@@ -1101,6 +1124,10 @@ def cmd_stats(args):
     if paired_count:
         print(f"confirmed paired outcomes: {len(pairs)}/{paired_count}; "
               f"{paired_count - len(pairs)} awaiting verified completion")
+    measured = [p for p in preds if p.get("measured")]
+    if measured:
+        print(f"measured ETA coverage: {sum(p['est_s'] is not None for p in measured)}/{len(measured)} check-ins")
+    pairs = [(p, r) for p, r in pairs if p["est_s"] is not None]
     if pairs:
         skill = [abs(p["est_s"] - r["actual_s"]) for p, r in pairs]
         agent = [abs(p["agent_s"] - r["actual_s"]) for p, r in pairs]
@@ -1129,6 +1156,9 @@ def cmd_stats(args):
         actual = fmt_dur(r["actual_s"]) if r and r.get("actual_s") and r["status"] == "ok" else (
             r["status"] if r else ("awaiting done" if p.get("agent_s") is not None else
              "too short" if p.get("raw_s", 0) < 60 else "pending"))
+        if p["est_s"] is None:
+            print(f"no measured ETA; actual {actual}; {one_line(p.get('note') or '', 50)}")
+            continue
         hit = ""
         if r and r.get("status") == "ok":
             hit = "yes" if p["low_s"] <= r["actual_s"] <= p["high_s"] else "no"
@@ -1158,6 +1188,7 @@ def main(argv=None):
     p.set_defaults(fn=cmd_measure)
     p = sub.add_parser("estimate", help="compute, print and log the ETA")
     common(p)
+    p.add_argument("--measured", action="store_true", help="use observations only; agent minutes are a scoring baseline")
     p.add_argument("--agent-min", type=float, help="working agent's independent total remaining minutes")
     p.add_argument("--reference", help="repeatable description of the remaining work and its scale")
     p.add_argument("--model", help="working agent model identity")

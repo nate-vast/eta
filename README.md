@@ -4,12 +4,9 @@ Ask `/eta` during a task to get a remaining duration, finish time, rough range a
 
 ## How the forecast works
 
-The working agent gives its own total remaining time in private before seeing the skill's forecast. The script records both estimates at one timestamp.
+The agent privately records its own guess for comparison. The skill uses `--measured` for its user-facing estimate. Timing comes from measured batch throughput, previous successful command or CI runtimes, or the median remaining time on at least three comparable verified tasks. Known additional waits are included. A timed job can stand in for the whole task when the remaining work after success is also accounted for.
 
-- **Measured progress.** When the remaining work is a homogeneous batch, the script uses the actual time per completed unit and the number still to go.
-- **Previous command and CI runtimes.** An exact local shell command reads successful executions in up to 40 recent project transcripts from the selected harness. A GitHub Actions job URL retrieves successful jobs matching repository, workflow, branch, event and job name via the authenticated `gh` CLI. Completed attempt metadata is cached locally. For Actions, the skill first looks for five prior successes that were still in the same numbered, named step after the same time in that step. It measures from that point through the end of each historical job and accepts the agent’s guess if it falls inside the middle half of those durations. For an outside guess, a step that historically starts at least 80% of the way through the job (median) uses the nearest quartile. Earlier steps use the elapsed-time median, or the matching step median when elapsed-time history is sparse. When step history is sparse, it uses previous jobs that lasted longer than the current elapsed time. The fallback uses their median remaining duration. Both paths add the explicitly estimated work after success. Failed or cancelled jobs need a new whole-task assessment.
-- **Comparable finishes.** For recurring work, the last 40 eligible completed tasks from the same project directory, harness, model and remaining-work label provide a comparison. With at least three distinct tasks, the script scores three options against earlier outcomes. These are the working agent’s estimate, a blend with the historical median, and a correction for the agent’s observed timing bias. Each earlier task is left out when predicting its own outcome. The option with the lowest total absolute error supplies the forecast. Known nonoverlapping waits are removed before fitting and added back at their current duration.
-- **Cold start.** With insufficient comparable history or progress data, the output identifies the agent's own estimate as the fallback. The range is descriptive. The trials cover short coding tasks and measurable batches. See [paired accuracy trials](verify/PAIRED.md).
+With too little evidence, the skill reports **“No measured ETA yet.”** Closing that check-in still records an actual duration for future forecasts. Stats reports measured forecast coverage separately. The older CLI comparison mode remains available by omitting `--measured`; the [paired benchmarks](verify/PAIRED.md) evaluated that earlier behavior.
 
 At completion, the agent closes the specific forecast IDs after verifying the requested outcome. Giving up, starting another turn, and transcript inactivity leave paired forecasts open. `/eta stats` reports mean absolute error for both methods, wins, ties, losses, and open forecasts. The legacy call-count method has a separate track record.
 
@@ -27,7 +24,7 @@ On POSIX, ETA restricts its default history directory to its owner and stores hi
 ## CLI
 
 ```bash
-python3 ~/.eta/eta.py estimate --agent-min MINUTES --model MODEL --agent codex \
+python3 ~/.eta/eta.py estimate --measured --agent-min BASELINE_MINUTES --model MODEL --agent codex \
     --reference "remaining stage and scale" --task-id UNIQUE_JOB
 python3 ~/.eta/eta.py done --id PREDICTION_ID
 python3 ~/.eta/eta.py stats
