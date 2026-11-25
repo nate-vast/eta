@@ -991,12 +991,13 @@ def cmd_paired(args, now):
     if not args.no_record:
         append_jsonl(pred_path(), pred)
     if pred["est_s"] is None:
-        message = "No measured ETA yet. " + pred["basis"]
+        message = "No measured ETA yet. " + pred["basis"] + "."
         if args.json:
             print(json.dumps(dict(id=pid, recorded=not args.no_record, state="insufficient_evidence",
-                                  est_s=None, finish=None, method=pred["method"], basis=pred["basis"])))
+                                  est_s=None, finish=None, message=message, method=pred["method"], basis=pred["basis"])))
         else:
             print(message)
+            print("Report the missing measurement and next checkpoint. Keep the agent baseline private; omit any rough guess or finish time.")
             if not args.no_record:
                 print(f"after verified completion: python3 ~/.eta/eta.py done --id {pid}")
         return

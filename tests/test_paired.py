@@ -45,6 +45,16 @@ class Paired(Base):
         self.assertIn("Agent: mean absolute miss 14m 00s; too long on 1/1", report)
         self.assertIn("1 closer, 0 tied, 0 further", report)
 
+    def test_missing_evidence_user_reply_has_no_numeric_fallback(self):
+        result = self.forecast("frame-cutout", 22, "--measured", "--no-record")
+        self.assertIsNone(result["est_s"])
+        self.assertIsNone(result["finish"])
+        self.assertNotIn("22", result["message"])
+        text = run(["estimate", "--measured", "--agent-min", "22", "--model", "m",
+                    "--task-id", "cutout", "--reference", "cutout", "--no-record"])
+        self.assertIn("Keep the agent baseline private", text)
+        self.assertNotIn("22", text)
+
     def test_live_progress_and_fixed_wait(self):
         p = self.forecast("job", 5, "--batch", "20", "100", "30", "--wait-min", "2")
         self.assertEqual((p["est_s"], p["agent_s"]), (240, 300))
