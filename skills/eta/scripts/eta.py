@@ -992,9 +992,24 @@ def cmd_paired(args, now):
         append_jsonl(pred_path(), pred)
     if pred["est_s"] is None:
         message = "No measured ETA yet. " + pred["basis"] + "."
+        timings = []
+        if args.measured and os.environ.get("T3CODE_THREAD_ID"):
+            import sqlite3
+            import job_history
+            try:
+                timings = job_history.delegate_timings(os.environ["T3CODE_THREAD_ID"], now)
+            except (OSError, sqlite3.Error, ValueError, TypeError):
+                pass
+        for timing in timings:
+            cohort = "same model" if timing["same_model"] else f"{timing['provider']} across models"
+            message += (f" Active delegate {timing['model']} has run for {paired_duration(timing['elapsed_s'])}. "
+                        f"Among {timing['n']} earlier completed delegates ({cohort}) still running at this age, "
+                        f"median additional time was {paired_duration(timing['median_s'])} "
+                        f"(historical 10th–90th percentiles {paired_duration(timing['low_s'])} "
+                        f"to {paired_duration(timing['high_s'])}). Parent integration and testing are additional.")
         if args.json:
             print(json.dumps(dict(id=pid, recorded=not args.no_record, state="insufficient_evidence",
-                                  est_s=None, finish=None, message=message, method=pred["method"], basis=pred["basis"])))
+                                  est_s=None, finish=None, delegate_history=timings, message=message, method=pred["method"], basis=pred["basis"])))
         else:
             print(message)
             print("Report the missing measurement and next checkpoint. Keep the agent baseline private; omit any rough guess or finish time.")

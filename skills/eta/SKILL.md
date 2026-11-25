@@ -5,7 +5,7 @@ description: Estimate how long the working agent needs to finish its current tas
 
 # /eta
 
-Use only the numeric ETA issued by measured mode in the reply. When it returns “No measured ETA yet” (JSON state `insufficient_evidence`), report that result, the missing measurement and the next observable checkpoint. Never append your own rough guess, countdown, or clock time. The ID tracks the observation for later scoring.
+Use only the numeric ETA issued by measured mode in the reply. When it returns “No measured ETA yet” (JSON state `insufficient_evidence`), report that result, the missing measurement and the next observable checkpoint. If the result includes active-delegate timing history, quote its median and spread as historical time to worker handoff, including whether it pools models. Keep that separate from the parent’s remaining integration and checks. Never append your own rough guess, countdown, or clock time. The ID tracks the observation for later scoring.
 
 For `stats long`, run `python3 ~/.eta/eta.py stats --min-remaining-min 5` (use the requested threshold if supplied). For `stats`, run `python3 ~/.eta/eta.py stats`. For a task that is finished, say so. If blocked on a user decision, identify it.
 

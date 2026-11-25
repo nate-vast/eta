@@ -140,6 +140,49 @@ def recent_project_files(kind, cwd):
     return [path for _, path in sorted(files, reverse=True)[:40]]
 
 
+def delegate_timings(thread, now, database=None):
+    """Read T3 timing metadata for this thread's active delegates. Never read task text."""
+    database = database or Path.home() / ".t3/userdata/statev2.sqlite"
+    if not thread or not database.is_file():
+        return []
+    db = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=.2)
+    try:
+        # Restrict to original delegated tasks; continuation rows are separate turns.
+        table = "orchestration_v2_projection_subagents"
+        active = db.execute(f"""SELECT subagent_id, provider, json_extract(payload_json, '$.model'), started_at
+            FROM {table} WHERE thread_id=? AND status='running' AND completed_at IS NULL
+            AND subagent_id LIKE 'node:delegated-task:command%'""", (thread,)).fetchall()
+        results = []
+        for _, provider, model, started in active:
+            age = now - epoch(started)
+            if age < 0:
+                continue
+            rows = db.execute(f"""SELECT json_extract(payload_json, '$.model'), started_at, completed_at
+                FROM {table} WHERE provider=? AND status='completed' AND completed_at < ?
+                AND subagent_id LIKE 'node:delegated-task:command%'
+                ORDER BY completed_at DESC LIMIT 500""", (provider, started))
+            history = []
+            for past_model, begin, end in rows:
+                if not begin or not end:
+                    continue
+                residual = epoch(end) - epoch(begin) - age
+                if residual > 0:
+                    history.append((past_model, residual))
+            exact = [seconds for name, seconds in history if name == model and model]
+            same_model = len(exact) >= 5
+            samples = exact if same_model else [seconds for _, seconds in history]
+            if len(samples) < 5:
+                continue
+            ordered = sorted(samples)
+            results.append(dict(model=model, provider=provider, elapsed_s=age, same_model=same_model,
+                                same_model_n=len(exact), n=len(samples), median_s=median(samples),
+                                low_s=ordered[int(.1 * (len(samples)-1))],
+                                high_s=ordered[int(.9 * (len(samples)-1))]))
+        return results
+    finally:
+        db.close()
+
+
 def gh(endpoint):
     proc = subprocess.run(["gh", "api", endpoint], capture_output=True, text=True)
     if proc.returncode:

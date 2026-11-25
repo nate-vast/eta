@@ -12,6 +12,8 @@ At completion, the agent closes the specific forecast IDs after verifying the re
 
 Use `/eta stats long` to check whether the skill beats your agent when at least five minutes actually remained. It scores the first measured check-in per verified task, reports how often each estimate was too long, and counts tasks where the skill lacked evidence. Accuracy on long, open-ended work remains unproven.
 
+In T3 Code, when whole-task timing is unavailable and a delegate is running, the skill reads local delegation start and finish timestamps in read-only mode. It reports how much longer previous completed delegates ran after reaching the same age. It prefers the same model and labels a broader provider sample when fewer than five same-model examples qualify. This describes worker handoff only. Open, failed and cancelled historical runs are excluded, and the historical spread is not a confidence interval for the current task.
+
 ## Install
 
 ```bash
