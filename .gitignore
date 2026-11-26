@@ -11,3 +11,4 @@ verify/dl-*.log
 verify/brew.log
 verify/llama*.log
 verify/mlx.log
+verify/llm_cuts/

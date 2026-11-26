@@ -14,10 +14,12 @@ Integrators: call remaining_given(state). See its docstring for the state shape.
 
 Task rules (decided from what is on disk, see verify/REPLAY.md for numbers):
 - Prompts that do not start a task: /eta and other ETA asks, background or
-  delegate notifications, T3 inter-agent messages, compaction and builtin slash
-  commands (/compact, /model, ...), "[Request interrupted ...]" markers.
-- Scheduled-task prompts, T3 side chats and T3 delegated tasks do start a task but
-  are tagged by origin; the default prior is fitted on human-origin tasks only.
+  delegate notifications (including T3's "Delegated task <id> ... completed" notice to the
+  parent), T3 inter-agent messages, compaction and builtin slash commands (/compact,
+  /model, ...), "[Request interrupted ...]" markers. Claude Code background completions
+  that exist only as queue-operation / queued_command records count as notifications.
+- Scheduled-task prompts and T3 side chats do start a task but are tagged by origin;
+  the default prior is fitted on human-origin tasks only.
 - An ETA ask that arrives after the agent already ended its turn closes the task; the
   agent's answer to it is not task time. (On this machine most /eta asks reach the
   transcript only after the turn ended, see REPLAY.md.)
@@ -55,7 +57,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import eta as _eta  # noqa: E402  (reuse prompt cleaning, ETA detection, timestamps, pi paths)
 
-SCHEMA = 7
+SCHEMA = 8
 RESUME_S = 30 * 60          # a wake-up later than this, with nothing outstanding, starts no work
 STALE_S = 20 * 60           # newest task of a file touched this recently may still be running
 GAP_CAP = _eta.GAP_CAP      # active time counts each quiet gap as at most this
@@ -132,7 +134,10 @@ def classify_prompt(text: str, notify: bool = False) -> str | None:
     if t.startswith("You are in a side chat"):
         return "side"
     if t.startswith("Delegated task"):
-        return "delegated"
+        # T3 posts this to the PARENT when a delegate finishes ("Delegated task <id> (title)
+        # completed ..."); it continues the parent's task. A child's own task arrives as a
+        # "[T3 Code: the agent in ...]" message instead.
+        return "notify"
     if t.startswith(_eta.SYSTEM_PREFIXES):
         return "meta"
     m = re.match(r"^/([\w:-]+)\s*$", t)

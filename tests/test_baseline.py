@@ -102,7 +102,7 @@ class TestClassify(unittest.TestCase):
             "Background command completed (exit 0): make": "notify",
             "[T3 Code: scheduled task \"daily\"]": "scheduled",
             "You are in a side chat beside the main thread.": "side",
-            "Delegated task node:abc do the thing": "delegated",
+            "Delegated task node:abc do the thing": "notify",
             "[Request interrupted by user]": "interrupt",
             "/compact": "meta", "/model opus": "human", "/code-review high": "human",
             "This session is being continued from a previous conversation": "meta",

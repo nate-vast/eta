@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Estimate the working agent's remaining wall time and score it at completion.
+"""/eta: when will the working agent's current task be done?
 
-The paired estimate uses measured batch progress or earlier confirmed comparable
-tasks. Legacy call-count estimates and transcript-based pace reports remain
-available. Local JSONL history lives in ~/.eta (override with ETA_HOME).
+    python3 ~/.eta/eta.py now --steps N [--note "what is left"]     the front door, always answers
+    python3 ~/.eta/eta.py done [--id ID ...]                        close it at verified completion
+    python3 ~/.eta/eta.py stats                                     track record
+
+`now` finds the live transcript itself, reads what the task has done so far, what it is
+waiting on (waits.py) and how long tasks like it ran on this machine (baseline.py), turns
+the agent's count of its own remaining tool calls into time with the pace measured on
+this task, and blends the parts into one midpoint and an 80% range (combine()).
+The agent never states time. Every prediction and each of its parts is logged in
+~/.eta (override with ETA_HOME) so each part can be scored on its own later.
+Python 3.9+, stdlib only.
 """
 from __future__ import annotations
 
@@ -13,6 +21,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import stat
 import statistics
 import sys
@@ -21,14 +30,37 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
+HERE = os.path.dirname(os.path.realpath(__file__))
+if HERE not in sys.path:            # job_history, baseline and waits live next to this file
+    sys.path.insert(0, HERE)
+# baseline.py and waits.py `import eta`; let them share this module instead of loading a copy.
+if __name__ in sys.modules:
+    sys.modules.setdefault("eta", sys.modules[__name__])
+
 GAP_CAP = 20 * 60          # a single quiet gap counts as at most this much active time
-LONG_OP = 90               # tool calls at least this long are "long operations"
-DEFAULT_SPC = 25.0         # seconds per tool call when nothing has been measured yet
-MIN_CALLS = 5              # calls needed before trusting this task's own pace
-MIN_CAL = 3                # resolved predictions needed before calibration kicks in
-CAL_WINDOW = 40            # use the most recent N resolved predictions
 STALE = 20 * 60            # a transcript quiet this long counts as finished
-DEFAULT_SPREAD = (0.6, 1.8)
+ASK_WINDOW = 15 * 60       # an /eta ask in the transcript this recent is the one being answered
+
+# ---- pace: seconds of the agent's own work per tool call
+PACE_GAP_CAP = 300.0       # chosen: a quiet gap counts as at most 5 min of own work
+MIN_CALLS = 5              # calls needed before trusting this task's own pace
+DEFAULT_PACE = 25.0        # used only when there is no history at all
+
+# ---- combiner (see combine() and verify/COMBINE.md for where each number comes from)
+W_STEPS = 0.5              # CHOSEN, not fit: weight of (own work + open waits) vs the history
+                           # prior, in log space, when the agent gives a step count. A real count
+                           # cannot be replayed without a model; verify/llm_replay.py tests this.
+                           # With the true count (oracle) 0.5 to 1.0 all beat history alone.
+W_WAITS = 0.0              # FIT (verify/COMBINE.md): weight of waits (+ tail) vs the prior when
+                           # there is no step count. Every weight above 0 made the midpoint worse,
+                           # so without a count the answer is the history prior.
+USE_TAIL = True            # FIT: with W_WAITS > 0 the tail helped check-in asks, hurt one-off asks
+WIDTH = 1.3                # FIT: scale on blended log half-widths; 80% coverage on the replay
+                           # with oracle counts given 2x random noise (an assumption)
+STEP_SPREAD = (0.5, 2.0)   # CHOSEN: own work could take half to twice the count x pace
+CAP_FROM_P90 = 3.0         # CHOSEN: sanity bound when the prior has no p98: 3x its p90
+CAP_Q = 0.98               # sanity bound: history's 98th percentile at this elapsed time
+FLOOR_S = 15.0             # nothing finishes in less time than one more reply
 
 ETA_START = re.compile(r"^\s*(/eta\b|/skill:eta\b|\$eta\b|eta\b|eta[?:])", re.I)
 ETA_ASK = re.compile(
@@ -53,7 +85,8 @@ def secure_history(directory, private_dir):
         finally:
             os.close(fd)
     for name in ("predictions.jsonl", "resolutions.jsonl", "done.lock", "ci-history.sqlite",
-                 "ci-history.sqlite-journal", "ci-history.sqlite-shm", "ci-history.sqlite-wal"):
+                 "ci-history.sqlite-journal", "ci-history.sqlite-shm", "ci-history.sqlite-wal",
+                 "turns.jsonl", "waits-cache.json", "waits-progress.json"):
         path = os.path.join(directory, name)
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -113,6 +146,8 @@ def fmt_clock(ts: float, now: float | None = None) -> str:
         return f"{clock} tomorrow"
     if days > 1:
         return d.strftime("%a %b %d ") + clock
+    if days < 0:
+        return d.strftime("%a %b %d ") + clock
     return clock
 
 
@@ -146,9 +181,11 @@ def load_jsonl(path):
             line = line.strip()
             if line:
                 try:
-                    out.append(json.loads(line))
+                    row = json.loads(line)
                 except json.JSONDecodeError:
-                    pass
+                    continue
+                if isinstance(row, dict):
+                    out.append(row)
     return out
 
 
@@ -157,36 +194,6 @@ def append_jsonl(path, obj):
     with open(path, "a") as f:
         f.write(json.dumps(obj) + "\n")
 
-
-def norm_status(s) -> str:
-    s = str(s or "").lower()
-    if s in ("completed", "complete", "done", "finished"):
-        return "done"
-    if s in ("in_progress", "in-progress", "active", "doing", "running"):
-        return "doing"
-    if s in ("deleted", "cancelled", "canceled", "removed"):
-        return "deleted"
-    return "pending"
-
-
-def tool_desc(inp) -> str:
-    if not isinstance(inp, dict):
-        return one_line(str(inp), 70)
-    for k in ("description", "command", "file_path", "pattern", "url", "query", "prompt", "skill"):
-        v = inp.get(k)
-        if v:
-            return one_line(v if isinstance(v, str) else json.dumps(v), 70)
-    return ""
-
-
-# ---------------------------------------------------------------- transcript readers
-# Both readers emit the same event shapes:
-#   {"ts", "kind": "prompt", "text", "eta"}
-#   {"ts", "kind": "agent"}
-#   {"ts", "kind": "tool", "id", "name", "desc"}     tool call started
-#   {"ts", "kind": "tool_done", "id"}                tool result came back
-#   {"ts", "kind": "todos", "items": [[key, label, status], ...]}   full snapshot
-#   {"ts", "kind": "task", "key", "label"|None, "status"|None}      single-item update
 
 def _clean_prompt(content) -> str:
     if isinstance(content, list):
@@ -206,115 +213,12 @@ def _clean_prompt(content) -> str:
     return text
 
 
-def read_claude(path):
-    events, task_n = [], 0
-    with open(path, errors="replace") as f:
-        for line in f:
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            typ = d.get("type")
-            if typ not in ("user", "assistant") or d.get("isSidechain"):
-                continue
-            ts = parse_ts(d.get("timestamp"))
-            if ts is None:
-                continue
-            msg = d.get("message") or {}
-            content = msg.get("content") if isinstance(msg, dict) else None
-            if typ == "assistant":
-                events.append({"ts": ts, "kind": "agent"})
-                for b in content if isinstance(content, list) else []:
-                    if not isinstance(b, dict) or b.get("type") != "tool_use":
-                        continue
-                    name, inp = b.get("name") or "?", b.get("input") or {}
-                    events.append({"ts": ts, "kind": "tool", "id": b.get("id"),
-                                   "name": name, "desc": tool_desc(inp)})
-                    if name == "TodoWrite" and isinstance(inp.get("todos"), list):
-                        items = [[t.get("content") or t.get("activeForm") or str(i),
-                                  t.get("content") or "", norm_status(t.get("status"))]
-                                 for i, t in enumerate(inp["todos"]) if isinstance(t, dict)]
-                        events.append({"ts": ts, "kind": "todos", "items": items})
-                    elif name == "TaskCreate":
-                        task_n += 1
-                        events.append({"ts": ts, "kind": "task", "key": str(task_n),
-                                       "label": inp.get("subject") or inp.get("description") or "",
-                                       "status": "pending"})
-                    elif name == "TaskUpdate" and inp.get("taskId") is not None:
-                        events.append({"ts": ts, "kind": "task", "key": str(inp.get("taskId")),
-                                       "label": inp.get("subject"),
-                                       "status": norm_status(inp["status"]) if inp.get("status") else None})
-                continue
-            # user records
-            if isinstance(content, list) and any(
-                    isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
-                for b in content:
-                    if isinstance(b, dict) and b.get("type") == "tool_result":
-                        events.append({"ts": ts, "kind": "tool_done", "id": b.get("tool_use_id")})
-                continue
-            if d.get("isMeta") or d.get("isCompactSummary"):
-                continue
-            if d.get("turnOrigin") in ("task_notification", "system"):
-                continue
-            text = _clean_prompt(content)
-            if not text or text.startswith(SYSTEM_PREFIXES):
-                continue
-            events.append({"ts": ts, "kind": "prompt", "text": text, "eta": is_eta_prompt(text)})
-    return events
-
-
-CODEX_SKIP_ITEMS = {"UserMessage", "AgentMessage", "Reasoning"}
-
-
-def read_codex(path):
-    events, last_ts = [], None
-    with open(path, errors="replace") as f:
-        for line in f:
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ts = parse_ts(d.get("timestamp"))
-            if ts is None:
-                continue
-            p = d.get("payload") or {}
-            if d.get("type") == "event_msg" and p.get("type") == "item_completed":
-                it = p.get("item") or {}
-                k = it.get("type")
-                if k == "UserMessage":
-                    text = _clean_prompt([{"type": "text", "text": b.get("text", "")}
-                                          for b in it.get("content") or [] if isinstance(b, dict)])
-                    if text and not text.startswith(SYSTEM_PREFIXES):
-                        events.append({"ts": ts, "kind": "prompt", "text": text,
-                                       "eta": is_eta_prompt(text)})
-                elif k in ("AgentMessage", "Reasoning"):
-                    events.append({"ts": ts, "kind": "agent"})
-                elif k:
-                    # Codex logs tool items when they complete; start ~= previous event.
-                    tid = it.get("id") or uuid.uuid4().hex
-                    cmd = it.get("command")
-                    desc = cmd[-1] if isinstance(cmd, list) and cmd else (
-                        it.get("tool") or it.get("query") or it.get("path") or "")
-                    start = last_ts if last_ts is not None else ts
-                    events.append({"ts": start, "kind": "tool", "id": tid, "name": k,
-                                   "desc": one_line(str(desc), 70)})
-                    events.append({"ts": ts, "kind": "tool_done", "id": tid})
-            elif d.get("type") == "response_item" and p.get("type") == "function_call" \
-                    and p.get("name") == "update_plan":
-                try:
-                    plan = json.loads(p.get("arguments") or "{}").get("plan") or []
-                except (json.JSONDecodeError, AttributeError):
-                    plan = []
-                items = [[t.get("step") or str(i), t.get("step") or "", norm_status(t.get("status"))]
-                         for i, t in enumerate(plan) if isinstance(t, dict)]
-                if items:
-                    events.append({"ts": ts, "kind": "todos", "items": items})
-            last_ts = ts
-    events.sort(key=lambda e: e["ts"])
-    return events
-
+# ---------------------------------------------------------------- transcripts
+# Claude Code and Codex transcripts are parsed by baseline.py (one shared parser for prompts,
+# tool calls, interrupts, notifications and turn ends). pi's message stream is read here.
 
 def read_pi(path):
+    """pi session -> [{"ts", "kind": prompt|agent|tool|tool_done, ...}] in file order."""
     events = []
     with open(path, errors="replace") as f:
         for line in f:
@@ -339,8 +243,7 @@ def read_pi(path):
                 for b in content if isinstance(content, list) else []:
                     if isinstance(b, dict) and b.get("type") == "toolCall":
                         events.append({"ts": ts, "kind": "tool", "id": b.get("id"),
-                                       "name": b.get("name") or "?",
-                                       "desc": tool_desc(b.get("arguments") or {})})
+                                       "name": b.get("name") or "?"})
             elif role == "toolResult":
                 events.append({"ts": ts, "kind": "tool_done", "id": msg.get("toolCallId")})
     return events
@@ -362,7 +265,7 @@ def sniff_kind(path) -> str:
             return "codex"
         if first.get("type") == "session" and "cwd" in first:
             return "pi"
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, AttributeError):
         pass
     if "/.codex/" in path or os.path.basename(path).startswith("rollout-"):
         return "codex"
@@ -371,20 +274,10 @@ def sniff_kind(path) -> str:
     return "claude"
 
 
-READERS = {"claude": read_claude, "codex": read_codex, "pi": read_pi}
-
-
-def read_events(path, kind=None):
-    return READERS[kind or sniff_kind(path)](path)
-
-
-def _codex_files(days=3):
-    base = os.path.expanduser("~/.codex/sessions")
-    out = []
-    for i in range(days):
-        d = datetime.now() - timedelta(days=i)
-        out += glob.glob(os.path.join(base, d.strftime("%Y/%m/%d"), "rollout-*.jsonl"))
-    return out
+def _codex_glob(sid):
+    base = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
+    return (glob.glob(os.path.join(base, "sessions", "*", "*", "*", f"rollout-*{glob.escape(sid)}.jsonl"))
+            + glob.glob(os.path.join(base, "archived_sessions", f"rollout-*{glob.escape(sid)}.jsonl")))
 
 
 def _first_cwd(path, kind):
@@ -402,251 +295,367 @@ def _first_cwd(path, kind):
     return None
 
 
-def _recent(paths, days=3):
-    cutoff = time.time() - days * 86400
-    return [p for p in paths if os.path.getmtime(p) >= cutoff]
+def t3_db_path():
+    return os.environ.get("T3_STATE_DB", os.path.expanduser("~/.t3/userdata/statev2.sqlite"))
 
 
-def _all_candidates(agent=None):
-    out = []
+def _t3_query(sql, args=()):
+    """Read-only query on the T3 Code state database; [] when it is absent or busy."""
+    path = t3_db_path()
+    if not os.path.isfile(path):
+        return []
+    try:
+        db = sqlite3.connect("file:" + path + "?mode=ro", uri=True, timeout=0.5)
+    except sqlite3.Error:
+        return []
+    try:
+        return db.execute(sql, args).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        db.close()
+
+
+def t3_native_ids(thread_id):
+    """Provider session ids (Claude session id, Codex thread id) of a T3 thread, newest run first."""
+    rows = _t3_query("""SELECT json_extract(payload_json, '$.nativeThreadRef.nativeId')
+        FROM orchestration_v2_projection_provider_threads WHERE thread_id=?
+        ORDER BY COALESCE(last_run_ordinal, 0) DESC, updated_at DESC""", (thread_id,))
+    return [r[0] for r in rows if r[0]]
+
+
+def t3_child_sessions():
+    """Native session ids of T3 delegate children. They share the parent's project folder, so a
+    newest-file guess could otherwise pick a child that is still working while the parent waits."""
+    rows = _t3_query("""SELECT json_extract(p.payload_json, '$.nativeThreadRef.nativeId')
+        FROM orchestration_v2_projection_provider_threads p
+        JOIN orchestration_v2_projection_threads t ON t.thread_id = p.thread_id
+        WHERE json_extract(t.payload_json, '$.lineage.relationshipToParent') = 'subagent'""")
+    return {r[0] for r in rows if r[0]}
+
+
+def _by_session_id(sid, agent=None):
     if agent in (None, "claude"):
-        out += [(p, "claude") for p in _recent(glob.glob(os.path.expanduser(
-            "~/.claude/projects/*/*.jsonl")), 1)]
+        hit = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{glob.escape(sid)}.jsonl"))
+        if hit:
+            return hit[0], "claude"
     if agent in (None, "codex"):
-        out += [(p, "codex") for p in _codex_files(2)]
+        hit = _codex_glob(sid)
+        if hit:
+            return hit[0], "codex"
     if agent in (None, "pi"):
-        out += [(p, "pi") for p in _recent(glob.glob(os.path.join(
-            pi_sessions_dir(), "*", "*.jsonl")), 1)]
-    return out
+        hit = glob.glob(os.path.join(pi_sessions_dir(), "*", f"*{glob.escape(sid)}*.jsonl"))
+        if hit:
+            return hit[0], "pi"
+    return None, None
 
 
-def find_transcript(transcript=None, session=None, agent=None, cwd=None):
-    """Return (path, kind, how) for the live session, or (None, None, reason)."""
+def _usable_id(s):
+    return bool(s) and "$" not in s and "{" not in s and "<" not in s
+
+
+def find_transcript(transcript=None, session=None, agent=None, cwd=None, now=None):
+    """Return (path, kind, how) for the live session, or (None, None, reason).
+
+    Order: an explicit path; a session id (argument, then CLAUDE_CODE_SESSION_ID,
+    CLAUDE_SESSION_ID, CODEX_THREAD_ID); the T3 thread in T3CODE_THREAD_ID mapped to its
+    provider session through T3's state database; this folder's newest session that is not
+    a T3 delegate child; the newest transcript written in the last 3 minutes (a guess)."""
     if transcript:
-        return os.path.expanduser(transcript), sniff_kind(transcript), "given"
+        p = os.path.expanduser(transcript)
+        return p, sniff_kind(p), "given"
+    now = now or time.time()
     cwd = cwd or os.getcwd()
-    sids = [s for s in (session, os.environ.get("CLAUDE_SESSION_ID"),
-                        os.environ.get("CODEX_THREAD_ID")) if s and "${" not in s and "$" not in s]
-    for sid in sids:
-        if agent in (None, "claude"):
-            hit = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{glob.escape(sid)}.jsonl"))
-            if hit:
-                return hit[0], "claude", "session id"
-        if agent in (None, "codex"):
-            hit = [p for p in _codex_files(30) if sid in os.path.basename(p)]
-            if hit:
-                return hit[0], "codex", "session id"
-        if agent in (None, "pi"):
-            hit = glob.glob(os.path.join(pi_sessions_dir(), "*", f"*{glob.escape(sid)}*.jsonl"))
-            if hit:
-                return hit[0], "pi", "session id"
+    ids = [(session, "--session")] if _usable_id(session) else []
+    for var, harness in (("CLAUDE_CODE_SESSION_ID", "claude"), ("CLAUDE_SESSION_ID", "claude"),
+                         ("CODEX_THREAD_ID", "codex")):
+        if _usable_id(os.environ.get(var)) and agent in (None, harness):
+            ids.append((os.environ[var], var))
+    for sid, how in ids:
+        p, k = _by_session_id(sid, agent)
+        if p:
+            return p, k, f"session id ({how})"
+    if _usable_id(os.environ.get("T3CODE_THREAD_ID")):
+        for sid in t3_native_ids(os.environ["T3CODE_THREAD_ID"]):
+            p, k = _by_session_id(sid, agent)
+            if p:
+                return p, k, "T3 thread"
+    children = None
     cands = []
     if agent in (None, "claude"):
         slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)
         cands += [(p, "claude") for p in glob.glob(
             os.path.expanduser(f"~/.claude/projects/{glob.escape(slug)}/*.jsonl"))]
-    for p, k in _all_candidates(agent):
-        if k in ("codex", "pi") and _first_cwd(p, k) == cwd:
-            cands.append((p, k))
+    if agent in (None, "codex"):
+        for i in range(3):
+            d = datetime.fromtimestamp(now) - timedelta(days=i)
+            for p in glob.glob(os.path.join(os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex")),
+                                            "sessions", d.strftime("%Y/%m/%d"), "rollout-*.jsonl")):
+                if _first_cwd(p, "codex") == cwd:
+                    cands.append((p, "codex"))
+    if agent in (None, "pi"):
+        cands += [(p, "pi") for p in glob.glob(os.path.join(pi_sessions_dir(), "*", "*.jsonl"))
+                  if _first_cwd(p, "pi") == cwd]
     if cands:
-        p, k = max(cands, key=lambda c: os.path.getmtime(c[0]))
-        return p, k, "this folder's newest session"
-    # Last resort: whatever transcript is being written right now.
-    live = [c for c in _all_candidates(agent) if time.time() - os.path.getmtime(c[0]) < 180]
+        children = t3_child_sessions()
+        own = [c for c in cands if os.path.splitext(os.path.basename(c[0]))[0] not in children
+               and not any(ch in os.path.basename(c[0]) for ch in children if c[1] == "codex")]
+        if own:
+            p, k = max(own, key=lambda c: os.path.getmtime(c[0]))
+            return p, k, "this folder's newest session (GUESS: pass --session to be sure)"
+    live = []
+    for pat, k in ((os.path.expanduser("~/.claude/projects/*/*.jsonl"), "claude"),
+                   (os.path.join(pi_sessions_dir(), "*", "*.jsonl"), "pi")):
+        if agent in (None, k):
+            live += [(p, k) for p in glob.glob(pat) if now - os.path.getmtime(p) < 180]
     if live:
         p, k = max(live, key=lambda c: os.path.getmtime(c[0]))
-        others = len(live) - 1
-        return p, k, ("newest live transcript (GUESS: " + (f"{others} other sessions also active, "
-                      if others else "") + "pass --session to be sure)")
+        return p, k, f"newest live transcript (GUESS: {len(live) - 1} other sessions also active)"
     return None, None, "no transcript found"
 
 
-# ---------------------------------------------------------------- measuring
+# ---------------------------------------------------------------- the task right now
 
-def reduce_todos(events, until):
-    """Replay todo/task events up to `until`. Returns (items{key:[label,status]}, done_times{key:ts})."""
-    items, done_at = {}, {}
-    for e in events:
-        if e["ts"] > until:
-            break
-        if e["kind"] == "todos":
-            new = {}
-            for key, label, st in e["items"]:
-                new[key] = [label, st]
-                if st == "done" and key not in done_at and items.get(key, [None, None])[1] != "done":
-                    done_at[key] = e["ts"]
-            items = new
-        elif e["kind"] == "task":
-            cur = items.setdefault(e["key"], [e.get("label") or "", "pending"])
-            if e.get("label"):
-                cur[0] = e["label"]
-            if e.get("status"):
-                if e["status"] == "deleted":
-                    items.pop(e["key"], None)
-                    continue
-                if e["status"] == "done" and cur[1] != "done":
-                    done_at[e["key"]] = e["ts"]
-                cur[1] = e["status"]
-    return items, done_at
+def own_pace(task, e):
+    """(seconds of own work per tool call or None, calls so far, own-work seconds) at e seconds in.
 
-
-def history_spc():
-    xs = [p.get("spc") for p in load_jsonl(pred_path())
-          if p.get("spc") and p.get("pace_source") == "task"]
-    return statistics.median(xs[-30:]) if len(xs) >= 3 else None
-
-
-def measure(events, from_n=None, now=None, started=None, calls_done=None):
-    """Pace and progress for the current task. `started`/`calls_done` come from the agent itself
-    when no transcript is readable (or override what the transcript says)."""
-    now = now or time.time()
-    prompts = [e for e in events if e["kind"] == "prompt"]
-    end, eta_prompt = now, None
-    if prompts and prompts[-1]["eta"]:
-        eta_prompt = prompts[-1]
-        end = eta_prompt["ts"]
-    task_prompts = [p for p in prompts if not p["eta"] and p["ts"] <= end]
-    idx = max(1, min(from_n or 1, len(task_prompts))) if task_prompts else 0
-    task = task_prompts[-idx] if task_prompts else None
-    start = task["ts"] if task else (events[0]["ts"] if events else now)
-    if started:
-        start = started
-    win = [e for e in events if start <= e["ts"] <= end]
-
-    active = 0.0
-    for a, b in zip(win, win[1:]):
-        if b["kind"] == "prompt":      # waiting on the user is not working time
+    Own work = quiet gaps between the agent's actions, each capped at PACE_GAP_CAP, leaving out
+    gaps spent inside a delegate, a wait tool or a question to the user (those are waits)."""
+    calls = [c for c in task.get("c") or [] if c[0] <= e]
+    waits_iv = [(s, (end if end != -1 else 1e18)) for s, end, cls in calls if cls in "dwa"]
+    pts = sorted([0.0] + [a for a in task.get("a") or [] if a <= e])
+    work = 0.0
+    for x, y in zip(pts, pts[1:]):
+        if y <= x or any(s <= x and y <= f for s, f in waits_iv):
             continue
-        active += min(b["ts"] - a["ts"], GAP_CAP)
-
-    starts = {e["id"]: e for e in win if e["kind"] == "tool"}
-    durs = {}
-    for e in win:
-        if e["kind"] == "tool_done" and e["id"] in starts:
-            durs[e["id"]] = e["ts"] - starts[e["id"]]["ts"]
-    calls = len(starts)
-    if calls_done is not None and (not events or calls_done > calls):
-        calls = calls_done
-        if not win:                 # self-reported: assume steady work since the start
-            active = max(0.0, end - start)
-    long_ops = sorted(((durs[i], starts[i]["name"], starts[i]["desc"])
-                       for i in durs if durs[i] >= LONG_OP), reverse=True)
-    long_total = sum(min(d, GAP_CAP) for d, _, _ in long_ops)
-    open_tools = [starts[i] for i in starts if i not in durs and now - starts[i]["ts"] >= 10]
-
-    hist = history_spc()
-    if calls >= MIN_CALLS and active > 0:
-        spc, pace_source = active / calls, "task"
-        core_n = calls - len(long_ops)
-        spc_core = (active - long_total) / core_n if core_n > 0 else spc
-    else:
-        spc = spc_core = hist or DEFAULT_SPC
-        pace_source = "history" if hist else "default"
-
-    items, done_at = reduce_todos(events, end)
-    n_done = sum(1 for v in items.values() if v[1] == "done")
-    n_doing = sum(1 for v in items.values() if v[1] == "doing")
-    n_pending = sum(1 for v in items.values() if v[1] == "pending")
-    done_in_win = sorted(t for k, t in done_at.items() if t >= start and k in items)
-    step_s = steps_eta = None
-    if done_in_win:
-        step_s = (done_in_win[-1] - start) / len(done_in_win)
-        steps_eta = step_s * (n_pending + 0.5 * n_doing)
-
-    recent = []
-    for i, p in enumerate(reversed(task_prompts[-6:]), 1):
-        recent.append({"n": i, "ts": p["ts"], "text": one_line(p["text"], 90)})
-
-    return {
-        "now": now, "start": start, "end": end,
-        "task": one_line(task["text"], 160) if task else None, "self_reported": not events,
-        "task_n": idx, "eta_prompt": eta_prompt is not None,
-        "elapsed": end - start, "active": active, "calls": calls,
-        "spc": spc, "spc_core": spc_core, "pace_source": pace_source,
-        "long_ops": [{"secs": d, "name": n, "desc": s} for d, n, s in long_ops[:5]],
-        "open_tools": [{"name": t["name"], "desc": t["desc"], "running": now - t["ts"]}
-                       for t in open_tools[-3:]],
-        "todos": {"done": n_done, "doing": n_doing, "pending": n_pending,
-                  "doing_labels": [one_line(v[0], 60) for v in items.values() if v[1] == "doing"],
-                  "pending_labels": [one_line(v[0], 60) for v in items.values() if v[1] == "pending"],
-                  "step_s": step_s, "steps_eta": steps_eta},
-        "recent_prompts": recent,
-        "last_event_age": now - events[-1]["ts"] if events else None,
-    }
+        work += min(y - x, PACE_GAP_CAP)
+    n = len(calls)
+    return (work / n if n >= MIN_CALLS and work > 0 else None), n, work
 
 
-# ---------------------------------------------------------------- calibration
-
-def find_finish(pred, now):
-    """When did the work that `pred` was about actually stop? Returns (finish_ts|None, status)."""
-    path = pred.get("transcript")
-    if not path or not os.path.exists(path):
-        return None, ("lost" if now - pred["created"] > 2 * 86400 else "pending")
-    events = read_events(path, pred.get("kind"))
-    after = [e for e in events if e["ts"] > pred["created"] + 1]
-    nxt = next((e for e in after if e["kind"] == "prompt" and not e["eta"]), None)
-    if nxt:
-        body = [e for e in after if e["ts"] < nxt["ts"] and e["kind"] != "prompt"]
-    else:
-        last = events[-1]["ts"] if events else pred["created"]
-        if now - last < STALE and now - os.path.getmtime(path) < STALE:
-            return None, "pending"
-        body = [e for e in after if e["kind"] != "prompt"]
-    finish = body[-1]["ts"] if body else pred["created"]
-    actual = finish - pred["created"]
-    if actual < 30:
-        return finish, "inconclusive"      # agent stopped right after answering: no signal
-    if actual > 12 * 3600:
-        return finish, "abandoned"
-    return finish, "ok"
-
-
-def resolve_pending(now=None):
-    now = now or time.time()
-    done = {r["id"] for r in load_jsonl(res_path())}
-    for p in load_jsonl(pred_path()):
-        if p["id"] in done or p.get("raw_s", 0) < 60 or now - p["created"] < 60:
-            continue
-        try:
-            finish, status = find_finish(p, now)
-        except Exception as exc:  # never let one bad transcript break /eta
-            finish, status = None, f"error: {exc}"[:80]
-        if status == "pending":
-            continue
-        actual = (finish - p["created"]) if finish else None
-        append_jsonl(res_path(), {
-            "id": p["id"], "resolved": now, "status": status, "finish": finish,
-            "actual_s": actual, "ratio": (actual / p["raw_s"]) if actual and p.get("raw_s") else None,
-        })
-
-
-def calibration():
-    preds = {p["id"]: p for p in load_jsonl(pred_path())}
-    latest = {}
-    for r in load_jsonl(res_path()):
-        latest[r["id"]] = r
+def history_pace(tasks, harness=None, model=None):
+    """Median own-work seconds per call over finished tasks: same model family and harness when
+    30 tasks qualify, else the harness, else everything. Returns (pace, basis)."""
+    import baseline as B
     rows = []
-    for r in latest.values():
-        p = preds.get(r["id"])
-        if p and r.get("status") == "ok" and r.get("ratio"):
-            rows.append((p, r))
-    rows.sort(key=lambda pr: pr[0]["created"])
-    rows = rows[-CAL_WINDOW:]
-    ratios = [r["ratio"] for _, r in rows]
-    n = len(ratios)
-    hits = sum(1 for p, r in rows if p["low_s"] <= r["actual_s"] <= p["high_s"])
-    out = {"n": n, "factor": 1.0, "lo": DEFAULT_SPREAD[0], "hi": DEFAULT_SPREAD[1],
-           "hits": hits, "rows": rows}
-    if n >= MIN_CAL:
-        med = statistics.median(ratios)
-        out["factor"] = min(3.0, max(0.33, med))
-        if n >= 5:
-            out["lo"] = min(0.85, quantile(ratios, 0.2) / med)
-            out["hi"] = max(1.2, quantile(ratios, 0.8) / med)
-    return out
+    for t in tasks:
+        if not B.fit_eligible(t) or t["n"] < MIN_CALLS:
+            continue
+        p, _, _ = own_pace(t, t["wall"])
+        if p:
+            rows.append((t["h"], B.model_family(t.get("m")), p))
+    fam = B.model_family(model) if model else None
+    for label, keep in ((f"{harness} {fam} tasks", lambda r: r[0] == harness and r[1] == fam),
+                        (f"{harness} tasks", lambda r: r[0] == harness),
+                        ("all tasks", lambda r: True)):
+        xs = [r[2] for r in rows if keep(r)]
+        if len(xs) >= 30 or (label == "all tasks" and xs):
+            return statistics.median(xs), f"median of {len(xs)} past {label}"
+    return DEFAULT_PACE, "default, no history"
 
 
-# ---------------------------------------------------------------- commands
+def _ask_info(events, task, now):
+    """When was the /eta being answered asked, and had the agent already ended its turn by then?"""
+    t0 = task["t0"] if task else 0.0
+    asks = [e[1] for e in events if e[0] == "P" and e[2] == "eta" and t0 <= e[1] <= now + 1]
+    ask = asks[-1] if asks and now - asks[-1] <= ASK_WINDOW else None
+    if ask is None:
+        return None, None
+    ended_at = None
+    for e in events:
+        if e[1] >= ask:
+            break
+        if e[0] == "A":
+            ended_at = e[1] if e[2] else None
+        elif e[0] == "T":
+            ended_at = None
+    return ask, ended_at
+
+
+def session_state(path, kind, now):
+    """The newest task in a transcript as a live observer sees it at `now`.
+
+    Returns baseline's state (elapsed_s, calls, running tool, delegates open, ...) plus
+    started, task (the cached-shape timeline), ask_ts, turn_ended_at (set when the agent had
+    already ended its turn before this ask arrived), last_ts, model."""
+    import baseline as B
+    events, meta = B.PARSERS[kind](path)
+    events = [e for e in events if e[1] <= now]
+    tasks = B.split_tasks(events, kind, live=True)
+    task = tasks[-1] if tasks else None
+    if task is None:
+        return {"elapsed_s": 0.0, "harness": kind, "calls": 0, "task": None, "started": None,
+                "ask_ts": None, "turn_ended_at": None, "last_ts": None, "model": None}
+    st = B.state_at(task, max(0.0, now - task["t0"]))
+    ask, ended = _ask_info(events, task, now)
+    st.update(started=task["t0"], task=task, ask_ts=ask, turn_ended_at=ended,
+              last_ts=task["t0"] + task["wall"], model=task.get("m"), cwd=meta.get("cwd"))
+    return st
+
+
+# ---------------------------------------------------------------- the combiner
+
+def _seq(parts):
+    """Sum of (low, mid, high) parts done one after another: mids add, spreads add in quadrature."""
+    parts = [p for p in parts if p]
+    if not parts:
+        return None
+    mid = sum(p[1] for p in parts)
+    lo = mid - math.sqrt(sum((p[1] - p[0]) ** 2 for p in parts))
+    hi = mid + math.sqrt(sum((p[2] - p[1]) ** 2 for p in parts))
+    return (max(lo, max(p[0] for p in parts), 0.0), mid, hi)
+
+
+def _trip(d, lo="low_s", mid="p50_s", hi="high_s"):
+    return (float(d[lo]), float(d[mid]), float(d[hi])) if d and d.get(mid) is not None else None
+
+
+def combine(state, waits_forecast=None, own_steps=None, pace=None, *, w_steps=None, w_waits=None,
+            width=None, use_tail=None):
+    """Blend history, waits and the agent's own step count into (low, mid, high, parts), seconds.
+
+    state["prior"]:   history prior from baseline.remaining_given (p10, p50, p90; optional cap =
+                      its 98th percentile). Required: this function never reads history itself.
+    waits_forecast:   waits.forecast() dict or None; uses ["wait"] and ["tail"].
+    own_steps, pace:  tool calls of the agent's own work left and seconds per call, or None.
+
+    1. Component sum C, done one after another: the open waits, then either own work
+       (own_steps x pace, range STEP_SPREAD) or, without a step count, waits.py's parent tail.
+       Own work is pulled in to the history cap if it alone would exceed it (flagged).
+    2. No component (nothing open, no count): the prior is the answer.
+    3. Otherwise blend in log space: ln mid = w ln C_mid + (1 - w) ln P_mid, w = W_STEPS with a
+       step count, else W_WAITS. Lower and upper log half-widths blend the same way and are
+       scaled by WIDTH. Every constant is a module-level name; see the comments there."""
+    w_steps = W_STEPS if w_steps is None else w_steps
+    w_waits = W_WAITS if w_waits is None else w_waits
+    width = WIDTH if width is None else width
+    use_tail = USE_TAIL if use_tail is None else use_tail
+    prior = state["prior"]
+    P = (max(float(prior["p10"]), 1.0), max(float(prior["p50"]), FLOOR_S), max(float(prior["p90"]), FLOOR_S))
+    cap = float(prior.get("cap") or P[2] * CAP_FROM_P90)
+    parts = {"prior": {"low_s": P[0], "mid_s": P[1], "high_s": P[2], "cap_s": cap, "n": prior.get("n")},
+             "flags": []}
+    wf = waits_forecast or {}
+    wait = _trip(wf.get("wait"))
+    if wait and wait[1] <= 0 and wait[2] <= 0:
+        wait = None
+    comps = []
+    if wait:
+        comps.append(wait)
+        parts["wait"] = {"low_s": wait[0], "mid_s": wait[1], "high_s": wait[2]}
+    if own_steps is not None:
+        own_mid = max(0.0, float(own_steps)) * float(pace or DEFAULT_PACE)
+        if own_mid > cap:
+            parts["flags"].append(f"the step count implies {fmt_dur(own_mid)} of own work, more than "
+                                  f"{fmt_dur(cap)}, which history almost never sees at this point; "
+                                  f"pulled in to {fmt_dur(cap)}")
+            own_mid = cap
+        own = (own_mid * STEP_SPREAD[0], own_mid, own_mid * STEP_SPREAD[1])
+        comps.append(own)
+        parts["own"] = {"low_s": own[0], "mid_s": own[1], "high_s": own[2],
+                        "steps": own_steps, "pace_s": pace}
+        w = w_steps
+    else:
+        tail = _trip(wf.get("tail")) if wait and use_tail else None
+        if tail:
+            comps.append(tail)
+            parts["tail"] = {"low_s": tail[0], "mid_s": tail[1], "high_s": tail[2]}
+        w = w_waits
+        if w <= 0:
+            comps = []        # the fitted default: without a count, waits do not move the number
+    C = _seq(comps)
+    if C is None:
+        low, mid, high = P
+        parts["method"] = "history"
+    else:
+        c = (max(C[0], 1.0), max(C[1], FLOOR_S), max(C[2], FLOOR_S))
+        parts["component"] = {"low_s": C[0], "mid_s": C[1], "high_s": C[2], "weight": w}
+        lm = w * math.log(c[1]) + (1 - w) * math.log(P[1])
+        down = w * math.log(c[1] / min(c[0], c[1])) + (1 - w) * math.log(P[1] / min(P[0], P[1]))
+        up = w * math.log(max(c[2], c[1]) / c[1]) + (1 - w) * math.log(max(P[2], P[1]) / P[1])
+        mid = math.exp(lm)
+        low, high = mid * math.exp(-width * down), mid * math.exp(width * up)
+        parts["method"] = "steps+waits+history" if own_steps is not None and wait else \
+            "steps+history" if own_steps is not None else "waits+history"
+    mid = max(mid, FLOOR_S)
+    low, high = min(low, mid), max(high, mid)
+    return low, mid, high, parts
+
+
+# ---------------------------------------------------------------- evidence the agent names
+
+def ci_wait(ci, now):
+    """GitHub Actions as a wait: '' = the workflow running for this checkout, or a job URL."""
+    import job_history
+    try:
+        if ci.startswith("https://"):
+            h = job_history.ci_history(ci, home(), now)
+        else:
+            h = job_history.checkout_workflow_history(ci or None, now)
+    except job_history.WorkflowSelectionError as error:
+        return None, f"GitHub Actions: {error}"
+    except (OSError, KeyError, TypeError, ValueError, sqlite3.Error) as error:
+        return None, f"GitHub Actions timing unavailable ({type(error).__name__})"
+    if h.state != "running":
+        return None, f"GitHub Actions is {h.state}"
+    if len(h.remaining) < 3:
+        return None, f"GitHub Actions: only {len(h.remaining)} earlier successful runs lasted this long"
+    p50 = statistics.median(h.remaining)
+    if h.step and not h.late and h.elapsed_median is not None:
+        p50 = h.elapsed_median
+    return dict(kind="ci", label="GitHub Actions" + (f" step {h.step}" if h.step else ""), model=None,
+                started=now - h.elapsed, elapsed_s=h.elapsed, progress=None, p50_s=p50,
+                low_s=min(p50, quantile(h.remaining, .1)), high_s=max(p50, quantile(h.remaining, .9)),
+                n=len(h.remaining), basis=f"{len(h.remaining)} earlier successful runs still going at "
+                f"{fmt_dur(h.elapsed)}", id="ci", source="github", background=True), None
+
+
+def progress_wait(done, total, seconds, now):
+    import waits as W
+    est = W.progress_estimate({"done": done, "total": total, "unit": "units"}, seconds)
+    if not est:
+        return None
+    return dict(kind="batch", label="measured progress", model=None, started=now - seconds,
+                elapsed_s=seconds, progress={"done": done, "total": total}, p50_s=est["p50_s"],
+                low_s=est["low_s"], high_s=est["high_s"], n=est["n"], basis=est["basis"],
+                id="progress", source="agent", background=True)
+
+
+# ---------------------------------------------------------------- the front door
+
+def _prior(state, at=None):
+    """History prior at this elapsed time; with `at`, only tasks that had finished by then."""
+    import baseline as B
+    if at is None:
+        base = B.default_baseline()
+        tasks = None
+    else:
+        tasks = [t for t in B.tasks_from_records(list(B.load_cache().values()) or B.build(), at)
+                 if t["t0"] + t["wall"] < at]
+        base = B.Baseline(tasks)
+    r = base.remaining_given(state)
+    (cap,), _, _ = base.quantiles(state, (CAP_Q,))
+    r["cap"] = round(cap, 1)
+    return r, base, tasks
+
+
+def _history_tasks(at=None):
+    import baseline as B
+    tasks = B.tasks_from_records(list(B.load_cache().values()), at or time.time())
+    return [t for t in tasks if at is None or t["t0"] + t["wall"] < at]
+
+
+def parse_at(v):
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        ts = parse_ts(v)
+        if ts is None:
+            sys.exit(f"can't read --at {v!r}; use an ISO time or epoch seconds")
+        return ts
+
 
 def parse_started(v, now=None):
     """'14:05', '2:05pm', '25m' / '1h10m' ago, or ISO -> epoch seconds."""
@@ -674,441 +683,222 @@ def parse_started(v, now=None):
     return ts
 
 
-def _load(args):
-    path, kind, how = find_transcript(args.transcript, args.session, args.agent)
-    args.found_how = how
+def forecast_now(args, now=None):
+    """Everything `now` knows, as one dict (also what gets logged). Never refuses."""
+    import waits as W
+    at = parse_at(getattr(args, "at", None))
+    now = at or now or time.time()
+    path, kind, how = find_transcript(args.transcript, args.session, args.agent, now=now)
     if path and not os.path.exists(path):
-        sys.exit(f"transcript not found: {path}")
-    if not path:
-        return None, None, []
-    return path, kind, read_events(path, kind)
-
-
-def _measure(args, events, now=None):
-    return measure(events, args.from_n, now, parse_started(args.started, now), args.calls_done)
-
-
-def render_measure(path, m, cal, how="", next_cmd="") -> str:
-    L = ["ETA MEASUREMENTS"]
-    if not path:
-        L.append("transcript: none readable for this harness, so this is self-reported mode.")
-        if m["calls"] == 0:
-            L.append("  Rerun with --started <when the task began, e.g. 14:05 or 25m> and "
-                     "--calls-done <tool calls you've made on it> from your own context.")
+        path, kind, how = None, None, f"transcript not found: {path}"
+    rec = dict(id=uuid.uuid4().hex[:12], v=2, created=now, transcript=path, kind=kind, found_by=how,
+               cwd=os.getcwd(), note=args.note, steps=args.steps, flags=[])
+    if args.agent_min is not None:
+        rec["agent_s"] = args.agent_min * 60          # private scoring baseline, never printed
+    if path:
+        st = session_state(path, kind, now)
     else:
-        L.append(f"transcript: {path}  (found by {how})")
-        if m["last_event_age"] and m["last_event_age"] > STALE:
-            L.append(f"WARNING: newest event is {fmt_dur(m['last_event_age'])} old; "
-                     "this may be the wrong session (pass --session or --transcript).")
-    if m["task"]:
-        L.append(f"task (prompt #{m['task_n']}): \"{m['task']}\"")
-        L.append(f"  started {fmt_clock(m['start'])}, {fmt_dur(m['elapsed'])} ago "
-                 f"({fmt_dur(m['active'])} active work)")
-    if len(m["recent_prompts"]) > 1:
-        L.append("recent prompts (if the task began earlier, rerun with --from N):")
-        for p in m["recent_prompts"]:
-            L.append(f"  [{p['n']}] {fmt_clock(p['ts'])}  {p['text']}")
-    L.append(f"tool calls so far: {m['calls']}")
-    src = {"task": "measured on this task", "history": "your median from past tasks",
-           "default": "default, nothing measured yet"}[m["pace_source"]]
-    L.append(f"pace: {m['spc']:.0f} s per call all-in, {m['spc_core']:.0f} s per call "
-             f"excluding long operations ({src})")
-    for op in m["long_ops"]:
-        L.append(f"  long op: {op['name']} {fmt_dur(op['secs'])}  {op['desc']}")
-    for t in m["open_tools"]:
-        L.append(f"  still running: {t['name']} for {fmt_dur(t['running'])}  {t['desc']}")
-    td = m["todos"]
-    if td["done"] + td["doing"] + td["pending"]:
-        L.append(f"todo list: {td['done']} done, {td['doing']} in progress, {td['pending']} pending")
-        for lab in td["doing_labels"]:
-            L.append(f"  doing: {lab}")
-        for lab in td["pending_labels"][:8]:
-            L.append(f"  next:  {lab}")
-        if td["steps_eta"] is not None:
-            L.append(f"  step pace {fmt_dur(td['step_s'])} per finished step -> "
-                     f"~{fmt_dur(td['steps_eta'])} left by step count (cross-check)")
-    if cal["n"] >= MIN_CAL:
-        L.append(f"calibration: {cal['n']} past ETAs checked; you finish at x{cal['factor']:.2f} "
-                 f"your raw estimate (median); {cal['hits']}/{cal['n']} landed inside the range")
+        started = parse_started(args.started, now)
+        st = {"elapsed_s": (now - started) if started else 0.0, "harness": args.agent, "calls": None,
+              "task": None, "started": started, "ask_ts": None, "turn_ended_at": None,
+              "last_ts": None, "model": None}
+        rec["flags"].append("no transcript readable: elapsed time is self-reported" if started else
+                            "no transcript readable and no --started: answering from history alone")
+    task = st.get("task")
+    rec.update(task_t0=st.get("started"), elapsed_s=round(st["elapsed_s"], 1), calls=st.get("calls"),
+               model=st.get("model"))
+    prior_state = {k: v for k, v in st.items() if k not in ("task",)}
+    prior, base, hist_tasks = _prior(prior_state, at)
+    st["prior"] = prior
+    rec["prior"] = {k: prior[k] for k in ("p10", "p50", "p80", "p90", "cap", "n")}
+
+    # waits: what the transcript shows is open, plus measured progress and CI the agent names
+    history = W.load_history(now=now, budget_s=0.0 if at else 2.0)
+    wlist = []
+    if path:
+        try:
+            wlist = W.open_waits(path, kind, now, history, remember=not at)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            rec["flags"].append(f"could not read open waits ({type(error).__name__})")
+    for pat in args.ignore_wait or []:
+        wlist = [w for w in wlist if pat.lower() not in (w.get("label") or "").lower()]
+    if args.progress:
+        pw = progress_wait(*args.progress, now)
+        if pw:
+            wlist.insert(0, pw)
+    if args.ci is not None:
+        cw, why = ci_wait(args.ci, now)
+        if cw:
+            wlist.insert(0, cw)
+        elif why:
+            rec["flags"].append(why)
+    live = [w for w in wlist if w["kind"] != "stale"]
+    fc = W.forecast(path or "", kind or "claude", now, history, waits_=wlist) if wlist else \
+        {"waits": [], "wait": None, "tail": None, "total": None}
+    rec["waits"] = [{k: w.get(k) for k in ("kind", "label", "model", "elapsed_s", "p50_s", "low_s",
+                                           "high_s", "n", "basis")} for w in wlist]
+    rec["wait"], rec["tail"] = fc.get("wait"), fc.get("tail")
+
+    # what state is the task in?
+    ended_before_ask = st.get("turn_ended_at") is not None
+    if args.blocked:
+        rec.update(outcome="blocked", est_s=None, low_s=None, high_s=None, method="blocked on the user")
+    elif ended_before_ask and not live and not args.steps:
+        took = (st["turn_ended_at"] - st["started"]) if st.get("started") else None
+        rec.update(outcome="done", est_s=0.0, low_s=0.0, high_s=0.0, method="already done",
+                   finished=st["turn_ended_at"], took_s=took)
     else:
-        L.append(f"calibration: {cal['n']} past ETAs checked (needs {MIN_CAL}); no correction yet")
-    L.append("")
-    L.append("REQUIRED NEXT STEP (do not reply to the user yet): list the remaining steps, count "
-             "the tool calls each will really take (include test runs, fixes, verification, "
-             "commits), add known long waits in minutes, then run:")
-    L.append(f"  {next_cmd}")
-    L.append("Reply only after it prints ETA RESULT, using its numbers.")
+        rec["outcome"] = "estimate"
+        pace, psrc = None, None
+        if args.steps is not None:
+            if task:
+                pace = own_pace(task, st["elapsed_s"])[0]
+                psrc = "measured on this task"
+            if pace is None:
+                pace, psrc = history_pace(hist_tasks or _history_tasks(at), st.get("harness"), st.get("model"))
+        rec.update(pace_s=round(pace, 1) if pace else None, pace_source=psrc)
+        low, mid, high, parts = combine(st, fc if live else None, args.steps, pace)
+        rec.update(est_s=round(mid, 1), low_s=round(low, 1), high_s=round(high, 1),
+                   method=parts["method"], parts=parts)
+        rec["flags"] += parts["flags"]
+        # Alternatives logged for scoring each source on its own later.
+        nl, nm, nh, _ = combine(st, fc if live else None, None, None)
+        rec["alt"] = {"history": [prior["p10"], prior["p50"], prior["p90"]],
+                      "history+waits": [round(nl, 1), round(nm, 1), round(nh, 1)]}
+        if args.steps is not None:
+            own = args.steps * pace
+            rec["alt"]["steps_only"] = [round(own * STEP_SPREAD[0], 1), round(own, 1),
+                                        round(own * STEP_SPREAD[1], 1)]
+    return rec, st, how
+
+
+def confidence(rec):
+    if rec.get("est_s") is None or not rec.get("low_s"):
+        return "high" if rec.get("outcome") == "done" else "n/a"
+    ratio = rec["high_s"] / max(rec["low_s"], 1.0)
+    level = "high" if ratio <= 3 else "medium" if ratio <= 10 else "low"
+    if level == "high" and (rec.get("prior") or {}).get("n", 99) < 10 and rec.get("pace_source") != "measured on this task":
+        level = "medium"
+    return level
+
+
+def render(rec, st, how, script="~/.eta/eta.py"):
+    now = rec["created"]
+    L = []
+    so_far = (f"{fmt_dur(st['elapsed_s'])} on this task" if st.get("started") else "start time unknown")
+    if st.get("calls") is not None:
+        so_far += f", {st['calls']} tool calls"
+    if rec["outcome"] == "done":
+        took = f" after {fmt_dur(rec['took_s'])}" if rec.get("took_s") is not None else ""
+        L.append(f"ETA: already done. The task finished at {fmt_clock(rec['finished'], now)}{took}, "
+                 f"and nothing it started is still running.")
+        L.append("Reply with that and what was delivered. No need to keep working.")
+        return "\n".join(L)
+    if rec["outcome"] == "blocked":
+        L.append(f"ETA: waiting on you. Needed: {one_line(rec['blocked'] if rec.get('blocked') else '', 160)}")
+        L.append(f"Done so far: {so_far}.")
+        L.append("Reply with exactly what you need from the user.")
+        return "\n".join(L)
+    est, low, high = rec["est_s"], rec["low_s"], rec["high_s"]
+    L.append(f"ETA: about {fmt_dur(est)}, done around {fmt_clock(now + est, now)} "
+             f"(likely {fmt_dur(low)} to {fmt_dur(high)}, {fmt_clock(now + low, now)} to {fmt_clock(now + high, now)})")
+    L.append(f"Done so far: {so_far}.")
+    left = []
+    if rec.get("note"):
+        left.append(one_line(rec["note"], 120))
+    if rec.get("steps") is not None:
+        left.append(f"{rec['steps']} more tool calls of own work at about {rec['pace_s']:.0f}s each "
+                    f"({rec['pace_source']})")
+    for w in rec.get("waits") or []:
+        if w["kind"] == "stale":
+            continue
+        what = w["label"] + (f" ({w['model']})" if w.get("model") else "")
+        left.append(f"waiting on {w['kind']} {what}: running {fmt_dur(w['elapsed_s'] or 0)}, "
+                    f"about {fmt_dur(w['p50_s'])} left")
+    if not left:
+        left.append("not stated")
+    L.append("Left: " + "; ".join(left) + ".")
+    parts = rec.get("parts") or {}
+    pr = parts.get("prior") or rec["prior"]
+    basis = []
+    if parts.get("own"):
+        basis.append(f"own work {fmt_dur(parts['own']['mid_s'])} from the step count")
+    if parts.get("wait"):
+        basis.append(f"open waits about {fmt_dur(parts['wait']['mid_s'])} from how similar ones ran before")
+    if parts.get("tail"):
+        basis.append(f"about {fmt_dur(parts['tail']['mid_s'])} of wrap-up after them, typical here")
+    n = rec["prior"].get("n")
+    basis.append(f"{n} past tasks here that ran this long took about {fmt_dur(pr['mid_s'] if 'mid_s' in pr else pr['p50'])} more"
+                 if n else "almost no past tasks ran this long, so the history range is wide")
+    if parts.get("component"):
+        basis.append(f"blended {round(100 * parts['component']['weight'])}% measured parts, "
+                     f"{100 - round(100 * parts['component']['weight'])}% history")
+    L.append("Basis: " + "; ".join(basis) + ".")
+    conf = confidence(rec)
+    thin = " (thin basis)" if (n or 0) < 10 and rec.get("pace_source") != "measured on this task" else ""
+    L.append(f"Confidence: {conf}{thin}.")
+    for f in rec.get("flags") or []:
+        L.append(f"Note: {f}.")
+    if how and "GUESS" in how:
+        L.append(f"Note: transcript found by {how}.")
     return "\n".join(L)
 
 
-def cmd_measure(args):
-    resolve_pending()
-    path, kind, events = _load(args)
-    m = _measure(args, events)
-    cal = calibration()
-    if args.json:
-        cal = {k: v for k, v in cal.items() if k != "rows"}
-        print(json.dumps({"transcript": path, "kind": kind, "measure": m, "calibration": cal},
-                         indent=2))
-    else:
-        flags = []
-        if args.session and "$" not in args.session:
-            flags.append(f'--session "{args.session}"')
-        if args.transcript:
-            flags.append(f'--transcript "{args.transcript}"')
-        if args.agent:
-            flags.append(f"--agent {args.agent}")
-        if args.from_n:
-            flags.append(f"--from {args.from_n}")
-        if args.started:
-            flags.append(f'--started "{args.started}"')
-        if args.calls_done is not None:
-            flags.append(f"--calls-done {args.calls_done}")
-        script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0].endswith(".py") else "~/.eta/eta.py"
-        if script == os.path.abspath(os.path.expanduser("~/.eta/eta.py")):
-            script = "~/.eta/eta.py"
-        next_cmd = (f"python3 {script} estimate " + " ".join(flags) +
-                    ' --calls <N> [--wait-min <M>] --note "<what is left>"').replace("  ", " ")
-        print(render_measure(path, m, cal, args.found_how, next_cmd))
-
-
-def paired_duration(seconds):
-    """Keep the displayed point estimate close to what gets scored."""
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    minutes, remainder = divmod(round(seconds), 60)
-    return f"{minutes}m {remainder:02d}s"
-
-
-def confirmed_pairs():
-    """Original paired forecasts with explicit finish markers, joined once per id."""
-    resolutions = {r["id"]: r for r in load_jsonl(res_path())
-                   if r.get("by") == "done" and r.get("status") == "ok"}
-    return [(p, resolutions[p["id"]]) for p in load_jsonl(pred_path())
-            if p.get("agent_s") is not None and p["id"] in resolutions]
-
-
-def reference_scope(args):
-    return [os.path.realpath(os.getcwd()), args.agent or "other", args.model.strip().casefold()]
-
-
-def cmd_references(args):
-    scope = reference_scope(args)
-    labels = {p["cohort"][-1] for p, _ in confirmed_pairs() if p["cohort"][:-1] == scope}
-    print("\n".join(sorted(labels)) if labels else "No confirmed reference labels in this scope.")
-
-
-def reference_point(method, guess, samples):
-    """Forecast variable work; samples contain (agent seconds, actual seconds)."""
-    if method == "working agent":
-        return guess
-    if method == "agent and history":
-        return (guess + statistics.median(actual for _, actual in samples)) / 2
-    ratios = [actual / baseline for baseline, actual in samples if baseline > 0]
-    return guess * statistics.median(ratios) if ratios else guess
-
-
-def paired_forecast(pred, pairs):
-    """At most one observation per earlier task. Reference labels describe remaining work."""
-    by_run = {}
-    for old, result in pairs:
-        if (old["cohort"] != pred["cohort"] or old["run"] == pred["run"]
-                or result["resolved"] > pred["created"] or result["actual_s"] < old["wait_s"]):
-            continue
-        # Use the first forecast for that stage of each task, even for repeated check-ins.
-        if old["run"] not in by_run or old["created"] < by_run[old["run"]][0]["created"]:
-            by_run[old["run"]] = old, result
-    recent = sorted(by_run.values(), key=lambda pair: pair[1]["resolved"])[-CAL_WINDOW:]
-    wait = pred["wait_s"]
-    if pred.get("batch"):
-        completed, total, sample_s = pred["batch"]
-        remaining = sample_s * (total - completed) / completed
-        return dict(est_s=wait + remaining, low_s=wait + remaining * DEFAULT_SPREAD[0],
-                    high_s=wait + remaining * DEFAULT_SPREAD[1], n_cal=len(recent),
-                    method="measured progress", basis=f"{total - completed:g} units left at "
-                    f"{sample_s / completed:.2f}s per observed unit + {fmt_dur(wait)} of fixed waits")
-    if pred.get("measured"):
-        if len(recent) < MIN_CAL:
-            return dict(est_s=None, low_s=None, high_s=None, n_cal=len(recent),
-                        method="insufficient evidence", basis=f"{len(recent)} comparable verified finishes; need {MIN_CAL}")
-        observed = [r["actual_s"] - p["wait_s"] for p, r in recent]
-        return dict(est_s=wait + statistics.median(observed),
-                    low_s=wait + quantile(observed, .1), high_s=wait + quantile(observed, .9),
-                    n_cal=len(recent), method="verified task history",
-                    basis=f"median remaining duration of {len(recent)} comparable verified tasks plus fixed waits")
-    if len(recent) < MIN_CAL:
-        point = max(wait, pred["agent_s"])
-        return dict(est_s=point, low_s=wait + (point - wait) * DEFAULT_SPREAD[0],
-                    high_s=wait + (point - wait) * DEFAULT_SPREAD[1], n_cal=len(recent),
-                    method="agent fallback", basis=f"working agent estimate; {len(recent)} comparable finishes")
-    samples = [(max(0, p["agent_s"] - p["wait_s"]), r["actual_s"] - p["wait_s"])
-               for p, r in recent]
-    guess = max(0, pred["agent_s"] - wait)
-    # Estimate each historical task without its own result. On tied error prefer
-    # the unadjusted agent. No outcome from the current task enters this choice.
-    errors = {}
-    for method in ("working agent", "agent and history", "agent bias correction"):
-        residuals = []
-        for i, (past_guess, actual) in enumerate(samples):
-            estimate = reference_point(method, past_guess, samples[:i] + samples[i + 1:])
-            residuals.append(actual - estimate)
-        errors[method] = residuals
-    method = min(errors, key=lambda name: sum(abs(e) for e in errors[name]))
-    point = reference_point(method, guess, samples)
-    low = max(0, point + min(0, quantile(errors[method], .1)))
-    high = point + max(0, quantile(errors[method], .9))
-    return dict(est_s=wait + point, low_s=wait + low, high_s=wait + high, n_cal=len(recent),
-                method=method, basis=f"{method}, selected by absolute error on {len(recent)} "
-                f"earlier comparable tasks; fixed wait {fmt_dur(wait)}")
-
-
-def apply_command_plan(pred, args):
-    """Time a known sequence of remaining commands without running any of them."""
-    import job_history
-    if not args.measured or not args.agent or args.tail_min is not None:
-        sys.exit("--remaining-command needs --measured and --agent; include every remaining command")
-    elapsed = args.elapsed_s or 0
-    cwd = os.path.realpath(os.getcwd())
-    files = job_history.recent_project_files(args.agent, cwd)
-    history = {}
-    point = low = high = pred["wait_s"]
-    counts = []
-    for index, command in enumerate(args.remaining_command):
-        if command not in history:
-            history[command] = job_history.local_durations(((p, args.agent) for p in files),
-                                                          cwd, command, pred["created"])
-        samples = job_history.remaining(history[command], elapsed if index == 0 else 0)
-        if len(samples) < MIN_CAL:
-            pred["basis"] += f"; remaining command {index + 1} has only {len(samples)} matching runs"
-            return
-        counts.append(len(samples))
-        point += statistics.median(samples)
-        low += quantile(samples, .1)
-        high += quantile(samples, .9)
-    pred.update(est_s=point, low_s=low, high_s=high, method="remaining command history",
-                basis=f"{len(counts)} sequential commands, each timed from {min(counts)} or more "
-                      f"previous successes; includes {paired_duration(pred['wait_s'])} in separate waits")
-
-
-def apply_job_history(pred, args):
-    import job_history
-    import sqlite3
-
-    step = None
-    method = "job history"
-    if args.command is not None:
-        if args.elapsed_s is None or not args.agent:
-            sys.exit("--command needs --elapsed-s and --agent")
-        cwd = os.path.realpath(os.getcwd())
-        files = job_history.recent_project_files(args.agent, cwd)
-        durations = job_history.local_durations(((f, args.agent) for f in files),
-                                               cwd, args.command, pred["created"])
-        elapsed = args.elapsed_s
-        samples = job_history.remaining(durations, elapsed)
-    else:
-        if args.elapsed_s is not None:
-            sys.exit("--ci-job reads the attempt start time from GitHub; omit --elapsed-s")
+def cmd_now(args):
+    for v in (args.steps, args.agent_min):
+        if v is not None and (not math.isfinite(v) or v < 0):
+            sys.exit("--steps and --agent-min must be finite and not negative")
+    if args.progress and (not all(math.isfinite(x) and x >= 0 for x in args.progress)
+                          or args.progress[0] > args.progress[1] or args.progress[1] <= 0):
+        sys.exit("--progress needs DONE TOTAL SECONDS with 0 <= DONE <= TOTAL")
+    if args.steps is not None:
+        args.steps = int(round(args.steps))
+    rec, st, how = forecast_now(args)
+    if args.blocked:
+        rec["blocked"] = args.blocked
+    record = not args.no_record and args.at is None
+    if record:
         try:
-            if args.checkout_ci is not None:
-                history = job_history.checkout_workflow_history(args.checkout_ci, pred["created"])
-            else:
-                history = job_history.ci_history(args.ci_job, home(), pred["created"])
-            samples, elapsed, state = history.remaining, history.elapsed, history.state
-            step, method = history.step, history.method
-        except job_history.WorkflowSelectionError as error:
-            pred["basis"] += f"; {error}"
-            return
-        except (OSError, KeyError, TypeError, ValueError, sqlite3.Error) as error:
-            pred["basis"] += f"; CI history unavailable ({type(error).__name__})"
-            return
-        if state != "running":
-            if state in ("queued", "waiting", "requested", "pending"):
-                pred["basis"] += f"; CI job {state}, check again when it starts"
-                return
-            return state
-    if len(samples) < MIN_CAL:
-        pred["basis"] += f"; only {len(samples)} comparable successful runs exceeded {elapsed:.0f}s"
-        return
-    match = f"matching step {step!r}" if step else f"still active at {elapsed:.0f}s"
-    tail = 60 * args.tail_min
-    extra = tail + pred["wait_s"]
-    point = statistics.median(samples)
-    estimate_basis = "median time left"
-    if step is not None and pred.get("measured"):
-        if not history.late and history.elapsed_median is not None:
-            point = history.elapsed_median
-            estimate_basis = "whole-job median at the current elapsed time"
-    elif step is not None:
-        guess = max(0, pred["agent_s"] - extra)
-        lower, upper = quantile(samples, .25), quantile(samples, .75)
-        if lower <= guess <= upper:
-            point = guess
-            estimate_basis = "agent estimate within the historical middle half"
-        elif history.late:
-            point = min(upper, max(lower, guess))
-            estimate_basis = "agent estimate bounded by late-step history"
-        elif history.elapsed_median is not None:
-            point = history.elapsed_median
-            estimate_basis = "whole-job median at the current elapsed time"
-    pred.update(est_s=extra + point, low_s=extra + min(point, quantile(samples, .1)),
-                high_s=extra + max(point, quantile(samples, .9)), method=method,
-                job_samples=len(samples), job_elapsed_s=elapsed, tail_s=tail,
-                basis=f"{len(samples)} prior successful runs {match}; "
-                      f"{estimate_basis} plus {paired_duration(extra)} for subsequent work and waits")
-
-
-def cmd_paired(args, now):
-    if not args.reference or not args.reference.strip() or not args.model or not args.model.strip():
-        sys.exit("--agent-min needs --reference (remaining work) and --model")
-    if args.calls is not None or args.minutes is not None:
-        sys.exit("use --agent-min on its own with --reference and --model")
-    if not args.task_id or not args.task_id.strip():
-        sys.exit("--agent-min needs --task-id; reuse the id for the same job across check-ins")
-    pid = uuid.uuid4().hex[:12]
-    batch = args.batch
-    if batch and (not all(math.isfinite(x) and x > 0 for x in batch) or batch[0] > batch[1]):
-        sys.exit("--batch needs positive completed units, total units and elapsed seconds (completed <= total)")
-    reference = " ".join(args.reference.casefold().split())
-    pred = dict(id=pid, created=now, measured=args.measured, batch=batch, agent_s=args.agent_min * 60,
-                wait_s=(args.wait_min or 0) * 60,
-                cohort=reference_scope(args) + [reference], run=args.task_id,
-                kind=args.agent, cwd=os.getcwd(),
-                note=args.note or reference)
-    pred.update(paired_forecast(pred, confirmed_pairs()))
-    pred["event"] = args.event
-    if args.remaining_command:
-        apply_command_plan(pred, args)
-    elif args.command is not None or args.ci_job or args.checkout_ci is not None:
-        if args.tail_min is None:
-            sys.exit("specify --tail-min for work after the command (0 if its success completes the task)")
-        state = apply_job_history(pred, args)
-        if state:
-            message = f"CI job state: {state}. Reassess the remaining task before forecasting."
-            print(json.dumps({"state": state, "recorded": False, "message": message}) if args.json else message)
-            return
-    elif args.tail_min is not None or args.elapsed_s is not None:
-        sys.exit("--tail-min and --elapsed-s require a job history source")
-    if not args.no_record:
-        append_jsonl(pred_path(), pred)
-    if pred["est_s"] is None:
-        message = "No measured ETA yet. " + pred["basis"] + "."
-        timings = []
-        if args.measured and os.environ.get("T3CODE_THREAD_ID"):
-            import sqlite3
-            import job_history
-            try:
-                timings = job_history.delegate_timings(os.environ["T3CODE_THREAD_ID"], now)
-            except (OSError, sqlite3.Error, ValueError, TypeError):
-                pass
-        for timing in timings:
-            cohort = "same model" if timing["same_model"] else f"{timing['provider']} across models"
-            message += (f" Active delegate {timing['model']} has run for {paired_duration(timing['elapsed_s'])}. "
-                        f"Among {timing['n']} earlier completed delegates ({cohort}) still running at this age, "
-                        f"median additional time was {paired_duration(timing['median_s'])} "
-                        f"(historical 10th–90th percentiles {paired_duration(timing['low_s'])} "
-                        f"to {paired_duration(timing['high_s'])}). Parent integration and testing are additional.")
-        if args.json:
-            print(json.dumps(dict(id=pid, recorded=not args.no_record, state="insufficient_evidence",
-                                  est_s=None, finish=None, delegate_history=timings, message=message, method=pred["method"], basis=pred["basis"])))
-        else:
-            print(message)
-            print("Report the missing measurement and next checkpoint. Keep the agent baseline private; omit any rough guess or finish time.")
-            if not args.no_record:
-                print(f"after verified completion: python3 ~/.eta/eta.py done --id {pid}")
-        return
-    out = dict(id=pid, remaining=paired_duration(pred["est_s"]), finish=fmt_clock(now + pred["est_s"], now),
-               low=paired_duration(pred["low_s"]), high=paired_duration(pred["high_s"]),
-               recorded=not args.no_record, **{k: pred[k] for k in
-               ("est_s", "agent_s", "low_s", "high_s", "method", "basis", "n_cal")})
-    if pred.get("job_samples") is not None:
-        out.update(job_samples=pred["job_samples"], job_elapsed_s=pred["job_elapsed_s"],
-                   tail_s=pred["tail_s"])
+            resolve_pending(rec["created"])
+        except Exception:    # scoring old asks must never stop an answer
+            pass
+        append_jsonl(pred_path(), rec)
     if args.json:
-        print(json.dumps(out, indent=2))
-    else:
-        print("ETA RESULT")
-        print(f"remaining: ~{out['remaining']} (finish ~{out['finish']})")
-        print(f"rough range: {out['low']} to {out['high']}")
-        print(f"basis: {out['basis']}")
-        if not args.no_record:
-            print(f"after verified completion: python3 ~/.eta/eta.py done --id {pid}")
+        out = {k: v for k, v in rec.items() if k != "agent_s"}
+        out["recorded"] = record
+        out["text"] = render(rec, st, how)
+        print(json.dumps(out, indent=2, default=str))
+        return
+    print(render(rec, st, how))
+    if rec["outcome"] == "estimate":
+        print("")
+        print("NEXT: send these lines to the user now, in the same message as your next tool call, "
+              "and keep working. /eta is a check-in, not a stop.")
+    if record and rec["outcome"] == "estimate":
+        print(f"At verified completion run: python3 ~/.eta/eta.py done --id {rec['id']}")
 
 
 def cmd_estimate(args):
-    for value in (args.agent_min, args.wait_min, args.calls, args.minutes, args.elapsed_s, args.tail_min):
-        if value is not None and (not math.isfinite(value) or value < 0):
-            sys.exit("durations and call counts must be finite and nonnegative")
-    if args.agent_min is not None:
-        return cmd_paired(args, time.time())
-    if args.remaining_command or args.measured or args.batch or args.reference or args.model or args.task_id or args.command or args.ci_job or args.checkout_ci is not None or args.tail_min is not None or args.elapsed_s is not None:
-        sys.exit("paired forecast options require --agent-min")
-    if args.calls is None and args.minutes is None:
-        sys.exit("estimate needs --calls N (preferred) or --minutes M")
-    resolve_pending()
-    path, kind, events = _load(args)
-    now = time.time()
-    m = _measure(args, events, now)
-    cal = calibration()
-    wait_s = (args.wait_min or 0) * 60
-    if args.calls is not None:
-        spc = m["spc_core"] if args.wait_min else m["spc"]
-        raw = args.calls * spc + wait_s
-        basis = f"{args.calls} tool calls x {spc:.0f} s"
-        if wait_s:
-            basis += f" + {fmt_dur(wait_s)} of waits"
-    else:
-        raw = args.minutes * 60 + wait_s
-        basis = f"agent judgment {fmt_dur(args.minutes * 60)}" + (
-            f" + {fmt_dur(wait_s)} of waits" if wait_s else "")
-    work = max(0.0, raw - wait_s) * cal["factor"]
-    est = wait_s + work
-    low, high = wait_s + work * cal["lo"], wait_s + work * cal["hi"]
-    if cal["n"] >= 10 and cal["hi"] / cal["lo"] <= 2.5 and m["pace_source"] == "task":
-        conf = "high"
-    elif cal["n"] >= MIN_CAL or m["pace_source"] == "task":
-        conf = "medium"
-    else:
-        conf = "low"
-    pid = uuid.uuid4().hex[:12]
-    if not args.no_record:
-        append_jsonl(pred_path(), {
-            "id": pid, "created": now, "transcript": path, "kind": kind,
-            "session": os.path.splitext(os.path.basename(path))[0] if path else None,
-            "cwd": os.getcwd(), "task": m["task"], "task_start": m["start"],
-            "calls": args.calls, "minutes": args.minutes, "wait_s": wait_s,
-            "spc": m["spc"], "spc_core": m["spc_core"], "pace_source": m["pace_source"],
-            "raw_s": raw, "factor": cal["factor"], "n_cal": cal["n"],
-            "est_s": est, "low_s": low, "high_s": high, "note": args.note,
-        })
-    cal_txt = (f"calibration x{cal['factor']:.2f} from {cal['n']} past ETAs "
-               f"({cal['hits']}/{cal['n']} inside range)") if cal["n"] >= MIN_CAL else \
-        f"no calibration yet ({cal['n']}/{MIN_CAL} past ETAs checked)"
-    out = {
-        "id": pid, "remaining": fmt_dur(est), "low": fmt_dur(low), "high": fmt_dur(high),
-        "finish": fmt_clock(now + est, now), "finish_low": fmt_clock(now + low, now),
-        "finish_high": fmt_clock(now + high, now), "confidence": conf,
-        "basis": f"{basis} = {fmt_dur(raw)} raw; {cal_txt}",
-        "elapsed": fmt_dur(m["elapsed"]), "recorded": not args.no_record,
-    }
-    if args.json:
-        print(json.dumps(out, indent=2))
-        return
-    print("ETA RESULT")
-    print(f"remaining:  ~{out['remaining']}  (likely {out['low']} to {out['high']})")
-    print(f"finish:     ~{out['finish']}  (between {out['finish_low']} and {out['finish_high']})")
-    print(f"confidence: {conf}")
-    print(f"basis:      {out['basis']}")
-    print(f"so far:     {out['elapsed']} on this task, {m['calls']} tool calls")
-    print(f"logged:     {'yes, id ' + pid if out['recorded'] else 'no (--no-record)'}")
-    print("NEXT: reply to the user with these numbers (ETA, finish time, range, what's done, "
-          "what's left, basis). If the task isn't finished, do not end your turn: send the ETA "
-          "text together with your next task tool call in the same message, then keep going. "
-          "/eta is a check-in, not a stop.")
+    """Old interface kept so an older SKILL.md still gets an answer: maps onto `now`."""
+    if args.steps is None and args.calls is not None:
+        args.steps = args.calls
+    if args.progress is None and args.batch:
+        args.progress = args.batch
+    if args.ci is None and args.ci_job:
+        args.ci = args.ci_job
+    elif args.ci is None and args.checkout_ci is not None:
+        args.ci = args.checkout_ci
+    if args.note is None and args.reference:
+        args.note = args.reference
+    return cmd_now(args)
 
+
+# ---------------------------------------------------------------- scoring
 
 @contextmanager
 def finish_lock():
     """Serialize simultaneous close notifications. The OS releases locks on exit."""
+    os.makedirs(home(), exist_ok=True)
     with open(os.path.join(home(), "done.lock"), "a+b") as lock:
         if os.name == "nt":
             import msvcrt
@@ -1120,198 +910,235 @@ def finish_lock():
         yield
 
 
+def _scoreable(p):
+    return p.get("est_s") is not None and p.get("outcome", "estimate") == "estimate"
+
+
+def resolve_pending(now=None):
+    """Score open predictions from their transcripts: the task's end is the agent's last action
+    before the next real prompt (baseline.py's task rules). Explicit `done` always wins."""
+    import baseline as B
+    now = now or time.time()
+    done = {r["id"] for r in load_jsonl(res_path())}
+    by_file = {}
+    for p in load_jsonl(pred_path()):
+        if p.get("id") in done or not p.get("transcript") or not _scoreable(p) or now - p["created"] < 60:
+            continue
+        if p.get("agent_s") is not None and p.get("v") is None:
+            continue          # old paired forecasts only close by explicit `done`
+        by_file.setdefault((p["transcript"], p.get("kind") or sniff_kind(p["transcript"])), []).append(p)
+    for (path, kind), preds in by_file.items():
+        if not os.path.exists(path):
+            for p in preds:
+                if now - p["created"] > 2 * 86400:
+                    append_jsonl(res_path(), dict(id=p["id"], resolved=now, status="lost", by="transcript"))
+            continue
+        try:
+            tasks = B.mine_file(path, kind, now)["tasks"]
+        except Exception:     # one unreadable transcript must not stop scoring the rest
+            continue
+        for p in preds:
+            t0 = p.get("task_t0")
+            match = [t for t in tasks if (abs(t["t0"] - t0) < 1e-3 if t0 else t["t0"] <= p["created"])]
+            if not match:
+                continue
+            t = match[-1] if not t0 else match[0]
+            if t["end"] == "live":
+                continue
+            status = "ok" if t["end"] == "done" else t["end"]
+            finish = t["t0"] + t["wall"]
+            actual = max(0.0, finish - p["created"])
+            if status == "ok" and actual > 12 * 3600:
+                status = "abandoned"
+            append_jsonl(res_path(), dict(id=p["id"], resolved=now, status=status, by="transcript",
+                                         finish=finish, actual_s=actual))
+
+
+def resolutions():
+    """Latest resolution per prediction; an explicit `done` beats a transcript reading."""
+    out = {}
+    for r in load_jsonl(res_path()):
+        old = out.get(r.get("id"))
+        if old is None or r.get("by") == "done" or old.get("by") != "done":
+            out[r.get("id")] = r
+    return out
+
+
 def cmd_done(args):
-    """The agent (or user) says the task is finished now: close its open predictions exactly."""
+    """The task is verified finished now: close its open predictions with the exact time."""
     now = time.time()
+    preds = {p["id"]: p for p in load_jsonl(pred_path()) if "id" in p}
     if args.id:
-        predictions = {p["id"]: p for p in load_jsonl(pred_path())}
-        unknown = set(args.id) - predictions.keys()
+        unknown = set(args.id) - preds.keys()
         if unknown:
             sys.exit("unknown prediction id: " + ", ".join(sorted(unknown)))
-        with finish_lock():
-            closed = {r["id"] for r in load_jsonl(res_path()) if r.get("by") == "done"}
-            for pid in dict.fromkeys(args.id):
-                if pid in closed:
-                    print(f"{pid} already closed")
-                    continue
-                p = predictions[pid]
-                elapsed = now - p["created"]
-                append_jsonl(res_path(), dict(id=pid, resolved=now, finish=now, actual_s=elapsed,
-                                             status="ok", by="done",
-                                             ratio=elapsed / p["raw_s"] if p.get("raw_s") else None))
-                print(f"{pid} marked done: actual {fmt_dur(elapsed)}")
-        return
-    path, kind, how = find_transcript(args.transcript, args.session, args.agent)
-    resolved = {r["id"] for r in load_jsonl(res_path()) if r.get("status") == "ok" and r.get("by") == "done"}
-    cwd = os.getcwd()
-    hits = []
-    for p in load_jsonl(pred_path()):
-        if p.get("agent_s") is not None or p["id"] in resolved or now - p["created"] > 12 * 3600:
-            continue
-        same = (path and p.get("transcript") == path) or (
-            not path and not p.get("transcript") and p.get("cwd") == cwd)
-        if same:
-            hits.append(p)
-    for p in hits:
-        actual = now - p["created"]
-        append_jsonl(res_path(), {"id": p["id"], "resolved": now, "status": "ok", "by": "done",
-                                  "finish": now, "actual_s": actual,
-                                  "ratio": actual / p["raw_s"] if p.get("raw_s") else None})
-    if hits:
-        last = hits[-1]
-        print(f"marked done: {len(hits)} ETA(s) closed. Latest said {fmt_dur(last['est_s'])}, "
-              f"took {fmt_dur(now - last['created'])}.")
+        targets = list(dict.fromkeys(args.id))
     else:
+        path, _, _ = find_transcript(args.transcript, args.session, args.agent, now=now)
+        cwd = os.getcwd()
+        targets = [p["id"] for p in preds.values() if _scoreable(p) and now - p["created"] < 12 * 3600
+                   and ((path and p.get("transcript") == path)
+                        or (not path and not p.get("transcript") and p.get("cwd") == cwd))]
+    with finish_lock():
+        closed = {r["id"] for r in load_jsonl(res_path()) if r.get("by") == "done"}
+        n = 0
+        for pid in targets:
+            if pid in closed:
+                print(f"{pid} already closed")
+                continue
+            p = preds[pid]
+            actual = now - p["created"]
+            append_jsonl(res_path(), dict(id=pid, resolved=now, finish=now, actual_s=actual, status="ok",
+                                         by="done", ratio=actual / p["raw_s"] if p.get("raw_s") else None))
+            n += 1
+            said = f"said {fmt_dur(p['est_s'])}, " if p.get("est_s") is not None else ""
+            print(f"{pid} marked done: {said}took {fmt_dur(actual)}")
+    if not targets:
         print("nothing to close (no open ETA for this session in the last 12 h).")
 
 
-def long_task_stats(minutes):
-    if not math.isfinite(minutes) or minutes <= 0:
-        sys.exit("--min-remaining-min needs a positive finite duration")
-    # One observation per task prevents heavily monitored tasks dominating the score.
-    first = {}
-    for pred, result in sorted(confirmed_pairs(), key=lambda pair: pair[0]["created"]):
-        if pred.get("measured"):
-            first.setdefault((tuple(pred["cohort"][:-1]), pred["run"]), (pred, result))
-    eligible = [(p, r["actual_s"]) for p, r in first.values() if r["actual_s"] >= minutes * 60]
-    issued = [(p, actual) for p, actual in eligible if p["est_s"] is not None]
-    print(f"At least {minutes:g} minutes actually remained at first measured check-in: "
-          f"{len(issued)}/{len(eligible)} verified tasks received an ETA.")
-    if not issued:
-        print("No paired long-task forecasts to score yet.")
-        return
-    for label, key in (("Skill", "est_s"), ("Agent", "agent_s")):
-        misses = [p[key] - actual for p, actual in issued]
-        overs = [e for e in misses if e > 0]
-        print(f"{label}: mean absolute miss {paired_duration(statistics.mean(map(abs, misses)))}; "
-              f"too long on {len(overs)}/{len(issued)} tasks"
-              + (f" by {paired_duration(statistics.mean(overs))} on average." if overs else "."))
-    wins = sum(abs(p["est_s"] - actual) < abs(p["agent_s"] - actual) for p, actual in issued)
-    ties = sum(abs(p["est_s"] - actual) == abs(p["agent_s"] - actual) for p, actual in issued)
-    print(f"Skill vs agent: {wins} closer, {ties} tied, {len(issued)-wins-ties} further.")
+def _miss(pred, actual):
+    return abs(math.log(max(pred, 30.0) / max(actual, 30.0)))
+
+
+def _summary(rows, label):
+    """rows: [(low|None, mid|None, high|None, actual)] -> one line of metrics."""
+    n = len(rows)
+    ans = [r for r in rows if r[1] is not None]
+    if not n:
+        return f"{label}: nothing scored yet"
+    txt = f"{label}: answered {len(ans)}/{n} ({100 * len(ans) / n:.0f}%)"
+    if ans:
+        misses = [_miss(r[1], r[3]) for r in ans]
+        w2 = sum(m <= math.log(2) for m in misses)
+        txt += (f"; within 2x {w2}/{len(ans)} ({100 * w2 / len(ans):.0f}%); median miss "
+                f"{math.exp(statistics.median(misses)):.1f}x")
+        ranged = [r for r in ans if r[0] is not None and r[2] is not None]
+        if ranged:
+            hit = sum(r[0] <= r[3] <= r[2] for r in ranged)
+            txt += f"; inside the range {hit}/{len(ranged)} ({100 * hit / len(ranged):.0f}%)"
+    return txt
 
 
 def cmd_stats(args):
-    if args.min_remaining_min is not None:
-        return long_task_stats(args.min_remaining_min)
-    resolve_pending()
-    cal = calibration()
+    try:
+        resolve_pending()
+    except Exception as error:   # stats still prints what is already scored
+        print(f"(could not score open asks: {type(error).__name__})")
     preds = load_jsonl(pred_path())
-    res = {r["id"]: r for r in load_jsonl(res_path())}   # last resolution wins
-    print(f"ETA TRACK RECORD  ({len(preds)} logged, {cal['n']} scored by legacy calibration)")
-    pairs = confirmed_pairs()
-    paired_count = sum(p.get("agent_s") is not None for p in preds)
-    if paired_count:
-        print(f"confirmed paired outcomes: {len(pairs)}/{paired_count}; "
-              f"{paired_count - len(pairs)} awaiting verified completion")
-    measured = [p for p in preds if p.get("measured")]
-    if measured:
-        print(f"measured ETA coverage: {sum(p['est_s'] is not None for p in measured)}/{len(measured)} check-ins")
-    pairs = [(p, r) for p, r in pairs if p["est_s"] is not None]
-    if pairs:
-        skill = [abs(p["est_s"] - r["actual_s"]) for p, r in pairs]
-        agent = [abs(p["agent_s"] - r["actual_s"]) for p, r in pairs]
-        wins = sum(x < y for x, y in zip(skill, agent))
-        ties = sum(x == y for x, y in zip(skill, agent))
-        print(f"paired forecasts: {len(pairs)} explicitly closed; mean absolute error "
-              f"skill {statistics.mean(skill):.1f}s, agent {statistics.mean(agent):.1f}s; "
-              f"{wins} wins, {ties} ties, {len(pairs)-wins-ties} losses")
-        hits = sum(p["low_s"] <= r["actual_s"] <= p["high_s"] for p, r in pairs)
-        print(f"paired range coverage {hits}/{len(pairs)}; median absolute miss "
-              f"skill {statistics.median(skill)/60:.2f}m, agent {statistics.median(agent)/60:.2f}m; "
-              f"worst miss skill {max(skill)/60:.2f}m, agent {max(agent)/60:.2f}m")
-    if cal["n"]:
-        errs = [abs(r["actual_s"] - p["est_s"]) / max(r["actual_s"], 60) for p, r in cal["rows"]]
-        print(f"inside predicted range: {cal['hits']}/{cal['n']} "
-              f"({100 * cal['hits'] / cal['n']:.0f}%)   median error: {100 * statistics.median(errs):.0f}%")
-        print(f"current correction: x{cal['factor']:.2f}   range band: "
-              f"x{cal['lo']:.2f} to x{cal['hi']:.2f} around the estimate")
-    pending = [p for p in preds if p["id"] not in res and p.get("raw_s", 0) >= 60]
-    if pending:
-        print(f"waiting to be checked: {len(pending)}")
+    res = resolutions()
+    print(f"ETA TRACK RECORD  ({len(preds)} asks logged in {home()})")
+    answerable = [p for p in preds if p.get("outcome") in (None, "estimate", "done")]
+    answered = [p for p in answerable if p.get("est_s") is not None]
+    print(f"answer rate: {len(answered)}/{len(answerable)} asks got a number"
+          + (f" ({100 * len(answered) / len(answerable):.0f}%)" if answerable else ""))
+    floor = (args.min_remaining_min or 0) * 60
+    scored = []
+    for p in preds:
+        r = res.get(p.get("id"))
+        if not r or r.get("status") != "ok" or r.get("actual_s") is None or p.get("outcome") in ("done", "blocked"):
+            continue
+        if r["actual_s"] < floor:
+            continue
+        scored.append((p, r["actual_s"]))
+    if floor:
+        print(f"only asks where at least {args.min_remaining_min:g} min actually remained")
+    print(f"scored (finish known): {len(scored)}")
+    print("  " + _summary([(p.get("low_s"), p.get("est_s"), p.get("high_s"), a) for p, a in scored], "skill"))
+    guess = [(None, p["agent_s"], None, a) for p, a in scored if p.get("agent_s") is not None]
+    if guess:
+        print("  " + _summary(guess, "agent's private guess"))
+        both = [(p, a) for p, a in scored if p.get("agent_s") is not None and p.get("est_s") is not None]
+        if both:
+            closer = sum(_miss(p["est_s"], a) < _miss(p["agent_s"], a) for p, a in both)
+            print(f"  skill closer than the agent's guess on {closer}/{len(both)}")
+    for key in ("history", "history+waits", "steps_only"):
+        rows = [(*p["alt"][key], a) for p, a in scored if (p.get("alt") or {}).get(key)]
+        if rows:
+            print("  " + _summary(rows, f"part: {key}"))
+    open_n = sum(1 for p in preds if p.get("id") not in res and _scoreable(p))
+    if open_n:
+        print(f"waiting to be scored: {open_n}")
     print()
-    print(f"{'when':<16} {'said':>8} {'range':>17} {'actual':>8}  hit  task")
+    print(f"{'when':<16} {'said':>8} {'range':>17} {'actual':>8}  hit  note")
     for p in preds[-args.limit:]:
-        r = res.get(p["id"])
-        actual = fmt_dur(r["actual_s"]) if r and r.get("actual_s") and r["status"] == "ok" else (
-            r["status"] if r else ("awaiting done" if p.get("agent_s") is not None else
-             "too short" if p.get("raw_s", 0) < 60 else "pending"))
-        if p["est_s"] is None:
-            print(f"no measured ETA; actual {actual}; {one_line(p.get('note') or '', 50)}")
+        r = res.get(p.get("id"))
+        when = datetime.fromtimestamp(p["created"]).strftime("%m-%d %I:%M%p").lower()
+        actual = fmt_dur(r["actual_s"]) if r and r.get("status") == "ok" and r.get("actual_s") is not None \
+            else (r.get("status") if r else "open")
+        note = one_line(p.get("note") or p.get("task") or "", 48)
+        if p.get("outcome") in ("done", "blocked"):
+            print(f"{when:<16} {p['outcome']:>8} {'':>17} {'':>8}       {note}")
+            continue
+        if p.get("est_s") is None:
+            print(f"{when:<16} {'no ETA':>8} {'':>17} {actual:>8}       {note}")
             continue
         hit = ""
-        if r and r.get("status") == "ok":
+        if r and r.get("status") == "ok" and r.get("actual_s") is not None and p.get("low_s") is not None:
             hit = "yes" if p["low_s"] <= r["actual_s"] <= p["high_s"] else "no"
-        when = datetime.fromtimestamp(p["created"]).strftime("%m-%d %I:%M%p").lower()
-        rng = f"{fmt_dur(p['low_s'])}-{fmt_dur(p['high_s'])}"
-        print(f"{when:<16} {fmt_dur(p['est_s']):>8} {rng:>17} {actual:>8}  {hit:<4} "
-              f"{one_line(p.get('note') or p.get('task') or '', 50)}")
+        rng = f"{fmt_dur(p['low_s'])}-{fmt_dur(p['high_s'])}" if p.get("low_s") is not None else ""
+        print(f"{when:<16} {fmt_dur(p['est_s']):>8} {rng:>17} {actual:>8}  {hit:<4} {note}")
+
+
+# ---------------------------------------------------------------- CLI
+
+def _now_args(p, legacy=False):
+    p.add_argument("--steps", type=float, help="tool calls of your OWN work still to do (reads, edits, runs, "
+                   "fix-and-rerun cycles, checks, commits); 0 if nothing is left but waiting")
+    p.add_argument("--note", help="what is left, a few plain words")
+    p.add_argument("--session", help="session id (Claude Code: ${CLAUDE_SESSION_ID})")
+    p.add_argument("--blocked", metavar="WHAT", help="the task cannot go on until the user answers this")
+    p.add_argument("--progress", type=float, nargs=3, metavar=("DONE", "TOTAL", "SECONDS"),
+                   help="measured progress of a job the transcript cannot show: units done, total, seconds so far")
+    p.add_argument("--ci", nargs="?", const="", metavar="JOB_URL",
+                   help="the task waits on GitHub Actions: this checkout's running workflow, or a job URL")
+    p.add_argument("--ignore-wait", action="append", metavar="TEXT",
+                   help="an open wait (matched by label) that the deliverable does not need")
+    p.add_argument("--started", help="no transcript: when the task began (14:05, 2:05pm, 25m, ISO)")
+    p.add_argument("--agent-min", type=float, help=argparse.SUPPRESS)   # private scoring baseline
+    p.add_argument("--transcript", help="explicit transcript path")
+    p.add_argument("--agent", choices=["claude", "codex", "pi"], help="limit discovery to one harness")
+    p.add_argument("--at", help="answer as of this past moment (ISO or epoch); not logged")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--no-record", action="store_true", help="don't log this prediction")
+    if legacy:
+        S = argparse.SUPPRESS
+        p.add_argument("--calls", type=float, help=S)
+        p.add_argument("--batch", type=float, nargs=3, help=S)
+        p.add_argument("--ci-job", help=S)
+        p.add_argument("--checkout-ci", nargs="?", const="", help=S)
+        p.add_argument("--reference", help=S)
+        for flag in ("--model", "--task-id", "--event", "--command", "--remaining-command",
+                     "--minutes", "--wait-min", "--tail-min", "--elapsed-s", "--from", "--calls-done"):
+            p.add_argument(flag, action="append", help=S)
+        p.add_argument("--measured", action="store_true", help=S)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="eta", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-
-    def common(p):
-        p.add_argument("--session", help="session id (Claude Code: ${CLAUDE_SESSION_ID})")
-        p.add_argument("--transcript", help="explicit transcript .jsonl path")
-        p.add_argument("--agent", choices=["claude", "codex", "pi"],
-                       help="limit discovery to one harness")
-        p.add_argument("--from", dest="from_n", type=int,
-                       help="task started at recent prompt N (1 = latest non-ETA prompt)")
-        p.add_argument("--json", action="store_true")
-        p.add_argument("--started", help="any harness: when the task began (14:05, 2:05pm, 25m, ISO)")
-        p.add_argument("--calls-done", type=int, help="any harness: tool calls made on the task so far")
-
-    p = sub.add_parser("measure", help="read the live transcript and print pace + context")
-    common(p)
-    p.set_defaults(fn=cmd_measure)
-    p = sub.add_parser("estimate", help="compute, print and log the ETA")
-    common(p)
-    p.add_argument("--measured", action="store_true", help="use observations only; agent minutes are a scoring baseline")
-    p.add_argument("--agent-min", type=float, help="working agent's independent total remaining minutes")
-    p.add_argument("--reference", help="repeatable description of the remaining work and its scale")
-    p.add_argument("--model", help="working agent model identity")
-    sources = p.add_mutually_exclusive_group()
-    sources.add_argument("--remaining-command", action="append", metavar="COMMAND",
-                         help="repeat for each sequential command through verified completion")
-    sources.add_argument("--command", help="exact local shell command, measured from project transcripts")
-    sources.add_argument("--checkout-ci", nargs="?", const="", metavar="WORKFLOW",
-                         help="discover a running GitHub workflow for the checked-out commit")
-    sources.add_argument("--ci-job", help="GitHub Actions job URL")
-    p.add_argument("--elapsed-s", type=float, help="observed time since this command attempt started")
-    p.add_argument("--tail-min", type=float, help="estimated work after successful job completion")
-    p.add_argument("--event", default="check-in", choices=["check-in", "started", "retry", "overrun", "scope-change"])
-    sources.add_argument("--batch", type=float, nargs=3, metavar=("DONE", "TOTAL", "SECONDS"),
-                   help="homogeneous batch accounting for all variable work: observed units done, total, elapsed seconds")
-    p.add_argument("--task-id", help="stable identifier across forecasts for one task")
-    p.add_argument("--calls", type=int, help="tool calls still needed")
-    p.add_argument("--wait-min", type=float, help="known long waits (builds, downloads, CI), minutes")
-    p.add_argument("--minutes", type=float, help="direct estimate when calls can't be counted")
-    p.add_argument("--note", help="what is left, a few words")
-    p.add_argument("--no-record", action="store_true", help="don't log this prediction")
+    p = sub.add_parser("now", help="the ETA right now, reply-ready (always answers)")
+    _now_args(p)
+    p.set_defaults(fn=cmd_now)
+    p = sub.add_parser("estimate", help=argparse.SUPPRESS)
+    _now_args(p, legacy=True)
     p.set_defaults(fn=cmd_estimate)
-    p = sub.add_parser("done", help="the task just finished: close its open ETAs (exact calibration)")
+    p = sub.add_parser("done", help="the task is verified finished: close its open ETAs")
+    p.add_argument("--id", nargs="+", help="prediction ids printed by `now`")
     p.add_argument("--session")
     p.add_argument("--transcript")
     p.add_argument("--agent", choices=["claude", "codex", "pi"])
-    p.add_argument("--id", nargs="+", help="explicitly close these verified predictions")
     p.set_defaults(fn=cmd_done)
-    p = sub.add_parser("references", help="show this model's confirmed remaining-work labels in this project")
-    p.add_argument("--agent", choices=["claude", "codex", "pi"])
-    p.add_argument("--model", required=True)
-    p.set_defaults(fn=cmd_references)
     p = sub.add_parser("stats", help="past ETAs vs actual finish times")
-    p.add_argument("--min-remaining-min", type=float, help="compare first measured check-ins by verified remaining time")
+    p.add_argument("--min-remaining-min", type=float, help="only asks where at least this much remained")
     p.add_argument("--limit", type=int, default=15)
     p.set_defaults(fn=cmd_stats)
-
     args = ap.parse_args(argv)
     args.fn(args)
 
 
 if __name__ == "__main__":
-    # Applies to new ledgers, locks and SQLite sidecars, including under ETA_HOME.
+    # Applies to new ledgers, locks and caches, including under ETA_HOME.
     os.umask(0o077)
     secure_history(home(), private_dir=os.path.abspath(home()) == os.path.expanduser("~/.eta"))
     main()

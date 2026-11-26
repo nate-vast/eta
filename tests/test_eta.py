@@ -14,6 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "skills", "eta", "scripts", "eta.py")
 spec = importlib.util.spec_from_file_location("eta", SCRIPT)
 eta = importlib.util.module_from_spec(spec)
+sys.modules.setdefault("eta", eta)   # baseline.py and waits.py share this copy
 spec.loader.exec_module(eta)
 
 
